@@ -50,7 +50,7 @@ android {
     compileSdk 36
 
     defaultConfig {
-        applicationId 'com.wanderwildwood.kotozute'
+        applicationId 'de.asdfghasdfgh.kotozute'
         minSdkVersion 26
         targetSdkVersion 33
         // Released builds take their version from the git tag: the release workflow derives
