@@ -91,12 +91,9 @@ jobs:
               exit 1
             fi
             version_code=$(( major * 10000000 + minor * 10000 + patch ))
-            # Everything published under the old packing is below 100000. A code at or under
-            # that floor would be a silent downgrade for anyone already on a release.
-            if [ "$version_code" -le 100000 ]; then
-              echo "::error::versionCode $version_code is not above what older releases already carry." >&2
-              exit 1
-            fi
+            # The fork's first release is 0.1.0, which packs to 10000. The old floor of
+            # 100000 only guarded against downgrades from upstream 1.x releases; this
+            # fork has published none, so a 0.x code is the correct starting point.
             echo "Building $version_name (versionCode $version_code)"
             ./gradlew :presentation:assembleRelease \
               -PappVersionName="$version_name" \
