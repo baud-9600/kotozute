@@ -43,7 +43,7 @@ if (realSigningPropsFile.isFile()) {
 // release workflow and every published checksum are keyed to `kotozute-v<version>` -- so it
 // moves to the base extension rather than being dropped.
 base {
-    archivesName = "kotozute-v${project.findProperty('appVersionName') ?: '1.0.1'}"
+    archivesName = "kotozute-v${project.findProperty('appVersionName') ?: '0.1.0'}"
 }
 
 android {
@@ -57,9 +57,9 @@ android {
         // both values from it and passes them in. Hand-editing this file was a release step
         // that got skipped once, shipping tag v1.0.2 as an APK still labelled 1.0.1.
         // The literals are the local-build fallback only, and never ship.
-        // (Reset to 1.0.0 for this fork's first release; upstream InkMessage was at 0.0.4.)
-        versionCode project.findProperty('appVersionCode')?.toInteger() ?: 2
-        versionName project.findProperty('appVersionName') ?: '1.0.1'
+        // (The fork's first release is 0.1.0; upstream InkMessage was at 0.0.4.)
+        versionCode project.findProperty('appVersionCode')?.toInteger() ?: 10000
+        versionName project.findProperty('appVersionName') ?: '0.1.0'
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
             // The Kompakt is arm64-v8a. A universal APK carrying four copies of
             // a 112 MB engine is not something anyone would install, and it is what made the
