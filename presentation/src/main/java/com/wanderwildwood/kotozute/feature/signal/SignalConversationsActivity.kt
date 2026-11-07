@@ -123,7 +123,6 @@ class SignalConversationsActivity : QkThemedActivity() {
         // same panel, and a list that scrolls freely next to one that does not is the kind of
         // difference a person feels without being able to name.
         binding.recyclerView.turnsAPageOnSwipe()
-        binding.recyclerView.liftsLastRowClearOf(binding.compose)
 
         bindShelf()
 

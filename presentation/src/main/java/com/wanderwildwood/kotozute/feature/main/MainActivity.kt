@@ -205,7 +205,6 @@ class MainActivity : QkThemedActivity(), MainView {
         conversationsAdapter.autoScrollToStart(binding.recyclerView)
 
         binding.recyclerView.turnsAPageOnSwipe()
-        binding.recyclerView.liftsLastRowClearOf(binding.compose)
 
         // Set the theme color tint to the recyclerView, progressbar, and FAB
         theme
