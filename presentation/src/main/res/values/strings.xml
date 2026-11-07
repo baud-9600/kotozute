@@ -513,6 +513,8 @@
     <!-- Settings row: one group chat or separate chats. -->
     <string name="settings_group_messages_title">Group messages</string>
     <!-- Settings row: what a swipe on a conversation does. -->
+    <!-- Settings row: what a swipe on a conversation does. -->
+    <string name="settings_swipe_actions">Swipe actions</string>
     <string-array name="settings_swipe_actions">
         <item>None</item>
         <item>Archive</item>
@@ -528,7 +530,7 @@
     <!-- The other direction. -->
     <string name="settings_swipe_actions_left">Left swipe</string>
     <!-- The small label that opens the list of actions (verb). -->
-    <string name="settings_swipe_actions_change">CHANGE</string>
+    <string name="settings_swipe_actions_change">Change</string>
     <!-- Settings row: ask the network for a delivery report. -->
     <string name="settings_delivery_title">Delivery confirmations</string>
     <!-- Settings row: MMS read receipts. -->

@@ -506,6 +506,8 @@
     <!-- Settings row: one group chat or separate chats. -->
     <string name="settings_group_messages_title">Gruppennachrichten</string>
     <!-- Settings row: what a swipe on a conversation does. -->
+    <!-- Settings row: what a swipe on a conversation does. -->
+    <string name="settings_swipe_actions">Wischgesten</string>
     <string-array name="settings_swipe_actions">
         <item>Keine</item>
         <item>Archivieren</item>
