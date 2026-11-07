@@ -272,7 +272,7 @@ Standing on a lot of other people's work:
 
 ## Getting it, and keeping it
 
-Download <https://github.com/wanderwildwood/kotozute/releases/latest/download/kotozute.apk> and
+Download <https://github.com/baud-9600/kotozute/releases/latest/download/kotozute.apk> and
 sideload it. That address always points at the newest release, and every release publishes a
 `.sha256` beside the APK if you would rather check than trust.
 
@@ -281,7 +281,7 @@ The app never updates itself: it does not check for updates, download them or in
 To be told about each new release, add this repository to
 [Obtainium](https://github.com/ImranR98/Obtainium):
 
-    https://github.com/wanderwildwood/kotozute
+    https://github.com/baud-9600/kotozute
 
 Obtainium will offer each new release as it appears. **The application id is settled** — updates
 install over what you have, keeping your settings and anything the app has stored.

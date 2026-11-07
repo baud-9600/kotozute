@@ -113,7 +113,7 @@ jobs:
       # that passes for every wrong key except the one it names.
       - name: Verify the signing certificate
         env:
-          EXPECTED: f4adf9a4ba3644c7ee15e0fb3619bd9c6f25073acd36d69d3bad9cd7f1a2fbcf
+          EXPECTED: 311b5cbb24e690121d1d2df664cb879e7a88b74ffee5be87c897c04a59aa6665
         run: |
           apk=$(find presentation/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -1)
           apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)

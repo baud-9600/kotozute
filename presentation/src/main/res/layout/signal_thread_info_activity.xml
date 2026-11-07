@@ -16,14 +16,14 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/toolbarTitle"
                 style="@style/ToolbarText"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/railBadge"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -57,7 +57,7 @@
             android:orientation="vertical"
             android:paddingBottom="24dp">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/name"
                 style="@style/TextPrimary"
                 android:layout_width="match_parent"
@@ -70,7 +70,7 @@
 
             <!-- The number, when Signal reports one. It often does not for someone who has
                  never been messaged, and inventing a placeholder would say more than we know. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/number"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -80,7 +80,7 @@
                 android:paddingEnd="16dp"
                 android:visibility="gone" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/about"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -90,7 +90,7 @@
                 android:paddingEnd="16dp"
                 android:visibility="gone" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/counts"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -101,7 +101,7 @@
                 android:paddingBottom="12dp" />
 
             <!-- Group members. Gone entirely on a one-to-one thread rather than shown empty. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/membersHeading"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -113,7 +113,7 @@
                 android:textStyle="bold"
                 android:visibility="gone" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/members"
                 style="@style/TextPrimary"
                 android:layout_width="match_parent"
@@ -137,7 +137,7 @@
             <!-- The safety number, and loudly when the key behind it has changed. This is
                  the honest half of "verify keys": trusting a changed key automatically is
                  the opposite of verification. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/safetyHeading"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -149,7 +149,7 @@
                 android:textStyle="bold"
                 android:visibility="gone" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/safetyNumber"
                 style="@style/TextPrimary"
                 android:layout_width="match_parent"
@@ -162,7 +162,7 @@
                 android:typeface="monospace"
                 android:visibility="gone" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/safetyState"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -177,7 +177,7 @@
               Shown only when the key has actually changed. A permanent "accept" button would
               train someone to press it, which is the opposite of what a safety number is for.
             -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/safetyAccept"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -186,7 +186,7 @@
                 app:title="@string/signal_safety_accept_title" />
 
             <!-- Mark verified, or clear it, once the numbers have been compared. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/safetyVerify"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -194,7 +194,7 @@
                 app:summary="@string/signal_safety_verify_summary"
                 app:title="@string/signal_safety_mark_verified" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/mediaHeading"
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
@@ -222,7 +222,7 @@
 
             <!-- The name the reader gives this person, and a note: Signal's Nickname screen.
                  Shown for one-to-one conversations only, once the person has a row. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/nickname"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -231,14 +231,14 @@
                 xmlns:app="http://schemas.android.com/apk/res-auto" />
 
             <!-- How long messages here last. Tells the other side, or changes the group. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/timer"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/info_timer"
                 xmlns:app="http://schemas.android.com/apk/res-auto" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/archive"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -248,7 +248,7 @@
             <!-- Joins this conversation to the text conversation with the same person.
                  Needed because Signal shares no phone number for most people, so the two
                  rails have nothing to match on. Local to this phone, and freely undone. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/link"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -256,7 +256,7 @@
                 app3:title="@string/info_link" />
 
             <!-- A group's Leave, with the other actions that end something. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/groupLeave"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -266,7 +266,7 @@
 
             <!-- Reaches the Signal account, not just this phone, so it holds everywhere.
                  Arms and confirms: it is outward-facing and not obviously undone. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/block"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -276,7 +276,7 @@
             <!-- Last, and after Block, because it is the one thing here that cannot be
                  undone. Arms and confirms, and says plainly that this phone holds the only
                  copy. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/deleteThread"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

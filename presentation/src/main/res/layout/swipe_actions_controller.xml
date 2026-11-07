@@ -17,7 +17,7 @@
   ~ You should have received a copy of the GNU General Public License
   ~ along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
   -->
-<com.wanderwildwood.kotozute.common.widget.PagingScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<de.asdfghasdfgh.kotozute.common.widget.PagingScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/scrollView"
@@ -37,7 +37,7 @@
             android:layout_height="wrap_content"
             android:foreground="?attr/selectableItemBackground">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/rightTitle"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -51,7 +51,7 @@
                 app:layout_constraintTop_toTopOf="parent"
                 app:textSize="primary" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/rightLabel"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -63,7 +63,7 @@
                 app:textSize="secondary"
                 tools:text="Archive" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/rightChange"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -153,7 +153,7 @@
             android:layout_height="wrap_content"
             android:foreground="?attr/selectableItemBackground">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/leftTitle"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -167,7 +167,7 @@
                 app:layout_constraintTop_toTopOf="parent"
                 app:textSize="primary" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/leftLabel"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -179,7 +179,7 @@
                 app:textSize="secondary"
                 tools:text="Archive" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/leftChange"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -264,4 +264,4 @@
 
     </LinearLayout>
 
-</com.wanderwildwood.kotozute.common.widget.PagingScrollView>
+</de.asdfghasdfgh.kotozute.common.widget.PagingScrollView>

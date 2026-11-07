@@ -16,7 +16,7 @@
 
     <!-- Centred, and shown only where there is a real gap in the conversation, exactly as
          the SMS thread does it. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/timestamp"
         style="@style/TextSecondary"
         android:layout_width="wrap_content"
@@ -26,7 +26,7 @@
         android:padding="8dp" />
 
     <!-- Only ever visible in a group thread; a one-to-one thread's title already says. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/sender"
         style="@style/TextTertiary"
         android:layout_width="wrap_content"
@@ -105,7 +105,7 @@
         android:columnCount="2"
         android:visibility="gone" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/attachment"
         style="@style/TextTertiary"
         android:layout_width="wrap_content"
@@ -151,7 +151,7 @@
                 android:splitTrack="false"
                 android:thumb="@drawable/audio_seekbar_thumb" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/voiceTime"
                 style="@style/TextSecondary"
                 android:layout_width="wrap_content"
@@ -164,7 +164,7 @@
     <!-- What this message is replying to, when it quotes something. Above the bubble and
          set in the muted colour, so it reads as context rather than as another message: a
          reply that answers nothing visible is the thing this exists to prevent. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/quote"
         style="@style/TextSecondary"
         android:layout_width="wrap_content"
@@ -179,7 +179,7 @@
 
     <!-- The bubble. Its background is chosen per message so a run from one person draws as
          one shape, the same four-way first/middle/last/only the SMS thread uses. -->
-    <com.wanderwildwood.kotozute.common.widget.TightTextView
+    <de.asdfghasdfgh.kotozute.common.widget.TightTextView
         android:id="@+id/body"
         style="@style/TextPrimary"
         android:layout_width="wrap_content"
@@ -192,7 +192,7 @@
          overlapping its corner as the SMS thread does: this is a LinearLayout, not the
          RelativeLayout that lets that one hang a chip off the edge, and an overlap that has
          to be faked with negative margins is worse than a line of its own. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/reactions"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -210,7 +210,7 @@
     <!-- Words, not ticks. Two grey check marks are a convention people learn from other apps
          and read badly at this size on a low-contrast panel; "Delivered" needs no legend.
          Shown only on our own messages, and only once something is actually known. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/status"
         style="@style/TextSecondary"
         android:layout_width="wrap_content"

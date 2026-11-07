@@ -24,7 +24,7 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginStart="24dp"
@@ -34,7 +34,7 @@
         android:textColor="?android:attr/textColorPrimary"
         app:textSize="dialog" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkEditText
+    <de.asdfghasdfgh.kotozute.common.widget.QkEditText
         android:id="@+id/input"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -47,21 +47,21 @@
         android:textColorHint="?android:attr/textColorTertiary"
         app:textSize="primary" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/caseSensitivity"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/message_content_filters_dialog_case_switch"
         app:widget="@layout/settings_switch_widget" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/regexp"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/message_content_filters_dialog_regex_switch"
         app:widget="@layout/settings_switch_widget" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/contacts"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

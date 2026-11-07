@@ -44,7 +44,7 @@
         android:layout_height="wrap_content"
         android:orientation="vertical">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/filename"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -60,7 +60,7 @@
             app:textSize="primary"
             tools:text="a test file.pdf" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/size"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

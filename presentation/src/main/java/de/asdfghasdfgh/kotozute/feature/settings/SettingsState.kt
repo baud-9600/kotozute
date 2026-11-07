@@ -1,0 +1,79 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.settings
+
+import de.asdfghasdfgh.kotozute.repository.SyncRepository
+import de.asdfghasdfgh.kotozute.util.Preferences
+
+data class SettingsState(
+    val black: Boolean = false,
+    val autoColor: Boolean = true,
+    val notificationsEnabled: Boolean = true,
+    val sendDelaySummary: String = "",
+    val sendDelayId: Int = 0,
+    val groupMessagesSummary: String = "",
+    val groupMessagesId: Int = 0,
+    val deliveryEnabled: Boolean = false,
+    val readReceiptsEnabled: Boolean = false,
+    val unreadAtTopEnabled: Boolean = false,
+    val keepMutedArchived: Boolean = false,
+    val allOnlyPeopleEnabled: Boolean = false,
+    val lockScreenEnabled: Boolean = true,
+    val signature: String = "",
+    val textSizeSummary: String = "",
+    val textSizeId: Int = Preferences.TEXT_SIZE_NORMAL,
+    val splitSmsEnabled: Boolean = false,
+    val stripUnicodeEnabled: Boolean = false,
+    val mobileOnly: Boolean = false,
+    val autoDelete: Int = 0,
+    val longAsMms: Boolean = false,
+    val maxMmsSizeSummary: String = "100KB",
+    val maxMmsSizeId: Int = 100,
+    val messageLinkHandlingSummary: String = "",
+    val messageLinkHandlingId: Int = 2,
+    val disableScreenshotsEnabled: Boolean = false,
+    val syncProgress: SyncRepository.SyncProgress = SyncRepository.SyncProgress.Idle,
+    val desktopSyncSummary: String = "",
+    val desktopSyncEnabled: Boolean = false,
+    /** "2 browsers", "None yet": how many browsers are paired. */
+    val desktopSyncBrowsersSummary: String = "",
+    /** How many browsers are paired; with Desktop Sync off, the rows to forget them show only when some are. */
+    val desktopSyncBrowsersCount: Int = 0,
+    val desktopSyncVpnOnly: Boolean = true,
+    val signalPaired: Boolean = false,
+    val signalEnabled: Boolean = false,
+    /** This phone is a device on the account. */
+    val signalLinkedDirectly: Boolean = false,
+    /**
+     * This phone is the account's **primary**, not a linked device -- so it owns the profile.
+     *
+     * Separate from [signalLinkedDirectly], which is true for both. Only a primary may write
+     * the account's own name.
+     */
+    val signalIsPrimary: Boolean = false,
+    /** Desktop Sync serves over TLS. See [Preferences.desktopSyncTls]. */
+    val desktopSyncTls: Boolean = false,
+    val signalStatusSummary: String = "",
+    val signalKeepConnected: Boolean = false,
+    val signalWeave: Boolean = true,
+    val signalOpensFirst: Boolean = false,
+    val askDefaultSms: Boolean = true,
+    val signalReadReceipts: Boolean = false,
+    val signalTypingIndicators: Boolean = true
+)

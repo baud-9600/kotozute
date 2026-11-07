@@ -1,0 +1,129 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.scheduled
+
+import android.content.Context
+import android.net.Uri
+import android.view.LayoutInflater
+import android.view.ViewGroup
+import androidx.core.view.isVisible
+import androidx.recyclerview.widget.RecyclerView
+import de.asdfghasdfgh.kotozute.R
+import de.asdfghasdfgh.kotozute.common.base.QkRealmAdapter
+import de.asdfghasdfgh.kotozute.common.base.QkBindingViewHolder
+import de.asdfghasdfgh.kotozute.databinding.ScheduledMessageListItemBinding
+import de.asdfghasdfgh.kotozute.common.util.DateFormatter
+import de.asdfghasdfgh.kotozute.model.Contact
+import de.asdfghasdfgh.kotozute.model.Recipient
+import de.asdfghasdfgh.kotozute.model.ScheduledMessage
+import de.asdfghasdfgh.kotozute.repository.ContactRepository
+import de.asdfghasdfgh.kotozute.util.PhoneNumberUtils
+import io.reactivex.subjects.PublishSubject
+import io.reactivex.subjects.Subject
+import javax.inject.Inject
+
+class ScheduledMessageAdapter @Inject constructor(
+    private val context: Context,
+    private val contactRepo: ContactRepository,
+    private val dateFormatter: DateFormatter,
+    private val phoneNumberUtils: PhoneNumberUtils
+) : QkRealmAdapter<ScheduledMessage, QkBindingViewHolder<ScheduledMessageListItemBinding>>() {
+
+    private val contacts by lazy { contactRepo.getContacts() }
+    private val contactCache = ContactCache()
+    private val imagesViewPool = RecyclerView.RecycledViewPool()
+
+    val clicks: Subject<Long> = PublishSubject.create()
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): QkBindingViewHolder<ScheduledMessageListItemBinding> {
+        val binding = ScheduledMessageListItemBinding.inflate(
+            LayoutInflater.from(parent.context), parent, false
+        )
+
+        binding.attachments.adapter = ScheduledMessageAttachmentAdapter(context)
+        binding.attachments.setRecycledViewPool(imagesViewPool)
+
+        return QkBindingViewHolder(binding).apply {
+            binding.root.setOnClickListener {
+                val message = getItem(adapterPosition) ?: return@setOnClickListener
+                if (toggleSelection(message.id, false))
+                    binding.root.isActivated = isSelected(message.id)
+            }
+            binding.root.setOnClickListener {
+                val message = getItem(adapterPosition) ?: return@setOnClickListener
+                toggleSelection(message.id)
+                binding.root.isActivated = isSelected(message.id)
+            }
+        }
+    }
+
+    override fun onBindViewHolder(holder: QkBindingViewHolder<ScheduledMessageListItemBinding>, position: Int) {
+        val message = getItem(position) ?: return
+
+        // The avatar is gone from the row, so there is nothing to fill -- and this was the
+        // one that cost most, building a Recipient per address to hand to a hidden view.
+
+        // A scheduled Signal message has no phone numbers to resolve -- Signal threads are
+        // keyed by uuid, and the thread's own name was stored here when it was scheduled.
+        // The rail is said out loud, because "why did that go by Signal" is the question a
+        // row like this otherwise invites.
+        holder.binding.recipients.text = if (message.signalThreadKey.isNotEmpty()) {
+            holder.binding.root.context.getString(
+                R.string.scheduled_via_signal,
+                message.recipients.firstOrNull().orEmpty()
+            )
+        } else {
+            message.recipients.joinToString(",") { address ->
+                contactCache[address]?.name?.takeIf { it.isNotBlank() } ?: address
+            }
+        }
+
+        holder.binding.date.text = dateFormatter.getScheduledTimestamp(message.date)
+        holder.binding.body.text = message.body
+
+        // update the selected/highlighted state
+        holder.binding.root.isActivated = isSelected(message.id) || highlight == message.id
+
+        val adapter = holder.binding.attachments.adapter as ScheduledMessageAttachmentAdapter
+        adapter.data = message.attachments.map(Uri::parse)
+        holder.binding.attachments.isVisible = message.attachments.isNotEmpty()
+    }
+
+    override fun getItemId(position: Int): Long {
+        return getItem(position)?.id ?: -1
+    }
+
+    /**
+     * Cache the contacts in a map by the address, because the messages we're binding don't have
+     * a reference to the contact.
+     */
+    private inner class ContactCache : HashMap<String, Contact?>() {
+
+        override fun get(key: String): Contact? {
+            if (super.get(key)?.isValid != true) {
+                set(key, contacts.firstOrNull { contact ->
+                    contact.numbers.any {
+                        phoneNumberUtils.compare(it.address, key)
+                    }
+                })
+            }
+            return super.get(key)?.takeIf { it.isValid }
+        }
+    }
+}

@@ -1,0 +1,766 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.settings
+
+import android.content.Context
+import com.uber.autodispose.android.lifecycle.scope
+import com.uber.autodispose.autoDisposable
+import de.asdfghasdfgh.kotozute.R
+import de.asdfghasdfgh.kotozute.common.Navigator
+import de.asdfghasdfgh.kotozute.common.base.QkPresenter
+import de.asdfghasdfgh.kotozute.common.util.extensions.makeToast
+import de.asdfghasdfgh.kotozute.feature.desktopsync.DesktopSyncService
+import de.asdfghasdfgh.kotozute.interactor.DeleteOldMessages
+import de.asdfghasdfgh.kotozute.interactor.SyncMessages
+import de.asdfghasdfgh.kotozute.repository.MessageRepository
+import de.asdfghasdfgh.kotozute.repository.SyncRepository
+import de.asdfghasdfgh.kotozute.service.AutoDeleteService
+import de.asdfghasdfgh.kotozute.util.Preferences
+import io.reactivex.rxkotlin.plusAssign
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import timber.log.Timber
+import java.util.concurrent.TimeUnit
+import de.asdfghasdfgh.kotozute.feature.signal.SignalStreamService
+import de.asdfghasdfgh.kotozute.feature.signal.SignalWording
+import de.asdfghasdfgh.kotozute.feature.signal.say
+import de.asdfghasdfgh.kotozute.repository.SignalRepository
+import android.text.format.DateUtils
+import javax.inject.Inject
+
+class SettingsPresenter @Inject constructor(
+    syncRepo: SyncRepository,
+    private val context: Context,
+    private val deleteOldMessages: DeleteOldMessages,
+    private val messageRepo: MessageRepository,
+    private val navigator: Navigator,
+    private val prefs: Preferences,
+    private val signalRepo: SignalRepository,
+    private val syncMessages: SyncMessages
+) : QkPresenter<SettingsView, SettingsState>(SettingsState()) {
+
+    init {
+        disposables += prefs.black.asObservable()
+                .subscribe { black -> newState { copy(black = black) } }
+
+        disposables += prefs.signalReadReceipts.asObservable()
+                .subscribe { on -> newState { copy(signalReadReceipts = on) } }
+        disposables += prefs.signalTypingIndicators.asObservable()
+                .subscribe { on -> newState { copy(signalTypingIndicators = on) } }
+
+        disposables += prefs.signalKeepConnected.asObservable()
+                .subscribe { on -> newState { copy(signalKeepConnected = on) } }
+
+        disposables += prefs.signalWeave.asObservable()
+                .subscribe { on -> newState { copy(signalWeave = on) } }
+
+        disposables += prefs.signalOpensFirst.asObservable()
+                .subscribe { on -> newState { copy(signalOpensFirst = on) } }
+
+        disposables += prefs.askDefaultSms.asObservable()
+                .subscribe { on -> newState { copy(askDefaultSms = on) } }
+
+        disposables += signalRepo.connectionState()
+                .subscribe { conn ->
+                    newState {
+                        copy(
+                            signalPaired = conn.configured,
+                            signalEnabled = conn.enabled,
+                            signalLinkedDirectly = conn.linkedDirectly,
+                            // Recomputed with every connection change rather than read once:
+                            // this phone becomes a primary the moment registration finishes,
+                            // and that arrives as a connection state change.
+                            signalIsPrimary = signalRepo.isPrimaryDevice(),
+                            signalStatusSummary = signalStatusSummary(conn)
+                        )
+                    }
+                }
+
+        disposables += prefs.notifications().asObservable()
+                .subscribe { enabled -> newState { copy(notificationsEnabled = enabled) } }
+
+        val delayedSendingLabels = context.resources.getStringArray(R.array.delayed_sending_labels)
+        disposables += prefs.sendDelay.asObservable()
+                .subscribe { id -> newState { copy(sendDelaySummary = delayedSendingLabels[id], sendDelayId = id) } }
+
+        // A text to two or more people: one group chat (MMS, everyone sees everyone), or the
+        // same text to each person in their own chat. Only the default for a new chat: each
+        // conversation keeps its own choice (Conversation.sendAsGroup), which the compose
+        // screen's switch changes.
+        val groupMessagesLabels = context.resources.getStringArray(R.array.group_messages_labels)
+        disposables += prefs.sendAsGroup.asObservable()
+                .map { group -> if (group) 0 else 1 }
+                .subscribe { id -> newState { copy(groupMessagesSummary = groupMessagesLabels[id], groupMessagesId = id) } }
+
+        disposables += prefs.delivery.asObservable()
+            .subscribe { enabled -> newState { copy(deliveryEnabled = enabled) } }
+
+        disposables += prefs.readReceipts.asObservable()
+            .subscribe { enabled -> newState { copy(readReceiptsEnabled = enabled) } }
+
+        disposables += prefs.desktopSyncEnabled.asObservable()
+            .subscribe { enabled ->
+                newState {
+                    copy(desktopSyncSummary = desktopSyncSummary(enabled), desktopSyncEnabled = enabled)
+                }
+            }
+
+        // The list is kept as one string; any change to it (a pairing, a Forget) recounts.
+        disposables += prefs.desktopSyncBrowsers.asObservable()
+            .subscribe {
+                val count = DesktopSyncService.browsers(context, prefs).list().size
+                val summary = if (count == 0) context.getString(R.string.settings_desktop_sync_browsers_summary_none)
+                    else context.resources.getQuantityString(R.plurals.settings_desktop_sync_browsers_summary, count, count)
+                newState { copy(desktopSyncBrowsersSummary = summary, desktopSyncBrowsersCount = count) }
+            }
+
+        disposables += prefs.desktopSyncTls.asObservable()
+            .subscribe { enabled -> newState { copy(desktopSyncTls = enabled) } }
+
+        disposables += prefs.desktopSyncVpnOnly.asObservable()
+            .subscribe { enabled ->
+                newState {
+                    copy(
+                        desktopSyncVpnOnly = enabled,
+                        desktopSyncSummary = desktopSyncSummary(prefs.desktopSyncEnabled.get()),
+                    )
+                }
+            }
+
+        disposables += prefs.unreadAtTop.asObservable()
+            .subscribe { enabled -> newState { copy(unreadAtTopEnabled = enabled) } }
+
+        disposables += prefs.keepMutedArchived.asObservable()
+            .subscribe { on -> newState { copy(keepMutedArchived = on) } }
+
+        disposables += prefs.allOnlyPeople.asObservable()
+            .subscribe { enabled -> newState { copy(allOnlyPeopleEnabled = enabled) } }
+
+        disposables += prefs.lockScreen.asObservable()
+            .subscribe { enabled -> newState { copy(lockScreenEnabled = enabled) } }
+
+        disposables += prefs.signature.asObservable()
+                .subscribe { signature -> newState { copy(signature = signature) } }
+
+        val textSizeLabels = context.resources.getStringArray(R.array.text_sizes)
+        disposables += prefs.textSize.asObservable()
+                .subscribe { textSize ->
+                    newState { copy(textSizeSummary = textSizeLabels[textSize], textSizeId = textSize) }
+                }
+
+        disposables += prefs.autoColor.asObservable()
+                .subscribe { autoColor -> newState { copy(autoColor = autoColor) } }
+
+        disposables += prefs.unicode.asObservable()
+                .subscribe { enabled -> newState { copy(stripUnicodeEnabled = enabled) } }
+
+        disposables += prefs.mobileOnly.asObservable()
+                .subscribe { enabled -> newState { copy(mobileOnly = enabled) } }
+
+        disposables += prefs.autoDelete.asObservable()
+                .subscribe { autoDelete -> newState { copy(autoDelete = autoDelete) } }
+
+        disposables += prefs.longAsMms.asObservable()
+                .subscribe { enabled -> newState { copy(longAsMms = enabled) } }
+
+        val mmsSizeLabels = context.resources.getStringArray(R.array.mms_sizes)
+        val mmsSizeIds = context.resources.getIntArray(R.array.mms_sizes_ids)
+        disposables += prefs.mmsSize.asObservable()
+                .subscribe { maxMmsSize ->
+                    val index = mmsSizeIds.indexOf(maxMmsSize)
+                    newState { copy(maxMmsSizeSummary = mmsSizeLabels[index], maxMmsSizeId = maxMmsSize) }
+                }
+
+        val messageLinkHandlingLabels = context.resources.getStringArray(R.array.messageLinkHandlings)
+        val messageLinkHandlingIds = context.resources.getIntArray(R.array.messageLinkHandling_ids)
+        disposables += prefs.messageLinkHandling.asObservable()
+            .subscribe { messageLinkHandlingId ->
+                val index = messageLinkHandlingIds.indexOf(messageLinkHandlingId)
+                newState {
+                    copy(
+                        messageLinkHandlingSummary = messageLinkHandlingLabels[index],
+                        messageLinkHandlingId = messageLinkHandlingId
+                    )
+                }
+            }
+        disposables += prefs.disableScreenshots.asObservable()
+            .subscribe { enabled -> newState { copy(disableScreenshotsEnabled = enabled) } }
+
+        disposables += syncRepo.syncProgress
+                .sample(16, TimeUnit.MILLISECONDS)
+                .distinctUntilChanged()
+                .subscribe { syncProgress -> newState { copy(syncProgress = syncProgress) } }
+
+        disposables += syncMessages
+    }
+
+    override fun bindIntents(view: SettingsView) {
+        super.bindIntents(view)
+
+        view.preferenceClicks()
+                .autoDisposable(view.scope())
+                .subscribe {
+                    Timber.v("Preference click: ${context.resources.getResourceName(it.id)}")
+
+                    when (it.id) {
+                        R.id.categoryDisplay ->
+                            view.showSection(R.id.sectionDisplay, R.string.settings_category_general)
+
+                        R.id.categorySending ->
+                            view.showSection(R.id.sectionSending, R.string.settings_category_sending)
+
+                        R.id.categoryStorage ->
+                            view.showSection(R.id.sectionStorage, R.string.settings_category_storage)
+
+                        R.id.categoryDesktopSync ->
+                            view.showSection(R.id.sectionDesktop, R.string.settings_category_desktop_sync)
+
+                        R.id.categorySignal -> {
+                            view.showSection(R.id.sectionSignal, R.string.settings_category_signal)
+                            offerContactFetchOnce(view)
+                        }
+
+                        R.id.archived -> navigator.showArchived()
+
+                        R.id.scheduled -> navigator.showScheduled(null)
+
+                        R.id.blocking -> navigator.showBlockedConversations()
+
+                        R.id.backup -> navigator.showBackup()
+
+
+                        R.id.notifications -> navigator.showNotificationSettings()
+
+                        R.id.swipeActions -> view.showSwipeActions()
+
+
+                        R.id.delayed -> view.showDelayDurationDialog()
+
+                        R.id.groupMessages -> view.showGroupMessagesDialog()
+
+                        R.id.delivery -> prefs.delivery.set(!prefs.delivery.get())
+
+                        R.id.readReceipts -> prefs.readReceipts.set(!prefs.readReceipts.get())
+
+                        R.id.desktopSync -> {
+                            if (prefs.desktopSyncEnabled.get()) {
+                                DesktopSyncService.stop(context)
+                            } else {
+                                prefs.desktopSyncFailure.set("")
+                                DesktopSyncService.start(context)
+                            }
+                        }
+
+                        R.id.desktopSyncLink -> {
+                            val urls = desktopSyncUrls()
+                            // Empty because "VPN only" hid the Wi-Fi address, or empty because
+                            // there is nothing at all: the fix is different, so the words are.
+                            val hiddenByVpnOnly = urls.isEmpty() && prefs.desktopSyncVpnOnly.get() &&
+                                DesktopSyncService.reachableAddresses(context).isNotEmpty()
+                            view.showDesktopSyncLinkDialog(urls, hiddenByVpnOnly)
+                        }
+
+                        R.id.desktopSyncVpnOnly ->
+                            prefs.desktopSyncVpnOnly.set(!prefs.desktopSyncVpnOnly.get())
+
+                        R.id.desktopSyncReset -> view.askDesktopSyncReset()
+
+                        R.id.desktopSyncBrowsers ->
+                            view.showDesktopSyncBrowsers(DesktopSyncService.browsers(context, prefs).list())
+
+                        R.id.signalLink -> view.showSignalLink()
+                        R.id.signalRegister -> view.showSignalRegister()
+
+                        R.id.signalOpen -> navigator.showSignalConversations()
+
+                        // Enabling is only offered once the phone is on the account, so this
+                        // switch cannot put Signal into a configured-but-broken state.
+                        R.id.signalEnabled -> signalRepo.setEnabled(!prefs.signalEnabled.get())
+
+                        // ⚠ Shown, not set. This wrote a preference the account promptly
+                        // undid: read receipts are one setting for the whole Signal account,
+                        // and a **linked device cannot change it** -- upstream's
+                        // `MultiDeviceConfigurationUpdateJob` begins
+                        // `if (isLinkedDevice()) { "Not primary device, aborting..."; return }`,
+                        // and the other half of the change is a storage-service write on the
+                        // account record, which this app does not do (docs/DECISION-storage-write.md).
+                        //
+                        // So every flip here survived until the next configuration sync, which
+                        // this phone asks for on every start -- a switch that visibly did not
+                        // stick. It now says where the setting lives instead of pretending to
+                        // hold it. The switch still shows what the account says, which is worth
+                        // knowing and is the only true thing this row ever had to offer.
+                        R.id.signalReceipts ->
+                            context.makeToast(R.string.settings_signal_receipts_readonly)
+
+                        // The same kind of setting as read receipts, held by the account.
+                        R.id.signalAbout -> view.showSignalAboutDialog()
+                        R.id.signalUsername -> view.showSignalUsernameDialog()
+                        R.id.signalNumberPrivacy -> view.showSignalNumberPrivacyDialog()
+
+                        R.id.signalTyping ->
+                            context.makeToast(R.string.settings_signal_typing_readonly)
+
+                        // The service is started and stopped from here rather than by
+                        // watching the preference, so the thing that flips the switch is the
+                        // thing that acts on it and there is no second source of truth.
+                        R.id.signalNotificationsOff ->
+                            de.asdfghasdfgh.kotozute.feature.signal.NotificationsOff.open(context)
+
+                        R.id.signalFullScreenCalls ->
+                            de.asdfghasdfgh.kotozute.feature.signal.FullScreenCalls.open(context)
+
+                        R.id.signalBackground ->
+                            de.asdfghasdfgh.kotozute.feature.signal.BackgroundRunning.ask(context)
+
+                        R.id.signalKeepConnected -> {
+                            val on = !prefs.signalKeepConnected.get()
+                            prefs.signalKeepConnected.set(on)
+                            SignalStreamService.sync(context, on)
+                        }
+
+                        R.id.signalWeave -> prefs.signalWeave.set(!prefs.signalWeave.get())
+
+                        R.id.signalOpensFirst ->
+                            prefs.signalOpensFirst.set(!prefs.signalOpensFirst.get())
+
+                        R.id.askDefaultSms -> prefs.askDefaultSms.set(!prefs.askDefaultSms.get())
+
+                        // Read over the network, so off the main thread, and shown even
+                        // when it fails: a blank dialog would not say why it was blank.
+                        // ⚠ Takes effect on the next start of the server, not this instant:
+                        // the socket is made when Desktop Sync starts, so the switch restarts
+                        // it rather than leaving the setting and the socket disagreeing.
+                        R.id.desktopSyncTls -> {
+                            prefs.desktopSyncTls.set(!prefs.desktopSyncTls.get())
+                            // ⚠ One rebind, not a stop followed by a start: those race, and
+                            // losing the race leaves the relay down with nothing listening.
+                            if (prefs.desktopSyncEnabled.get()) {
+                                DesktopSyncService.rebind(context)
+                            }
+                        }
+
+                        R.id.signalProfileName -> view.askSignalProfileName()
+
+                        R.id.signalDevices -> view.showSignalDevices()
+
+                        R.id.signalAccount -> {
+                            Thread {
+                                val account = runCatching { signalRepo.account() }.getOrNull()
+                                view.showSignalAccountDialog(account)
+                            }.apply { isDaemon = true }.start()
+                        }
+
+                        // ⚠ Read on the phone, sent only if they choose to. There is no
+                        // crash reporting in this app by design, so this is the only way a
+                        // crash on somebody else's phone is ever describable -- and a stack
+                        // trace can carry message content, so it is shown before it is sent
+                        // rather than after.
+                        R.id.crashLog ->
+                            view.showCrashLog(
+                                de.asdfghasdfgh.kotozute.common.util.CrashLog.read(context)
+                            )
+
+                        R.id.signalFetchContacts -> fetchContacts(view)
+
+                        // Asks first. Everything else on this screen acts on the phone; this
+                        // one sends the address book's numbers off it.
+                        R.id.signalDiscoverContacts -> view.askDiscoverContacts()
+
+                        R.id.signalHistoryImport -> view.chooseSignalExportFolder()
+
+                        R.id.signalHistoryExport -> view.chooseSignalBackupFolder()
+
+                        R.id.signalUnpair -> view.askSignalUnpair()
+
+                        R.id.unreadAtTop -> prefs.unreadAtTop.set(!prefs.unreadAtTop.get())
+
+                        R.id.keepMutedArchived -> signalRepo.setKeepMutedArchived(!prefs.keepMutedArchived.get())
+
+                        R.id.allOnlyPeople -> prefs.allOnlyPeople.set(!prefs.allOnlyPeople.get())
+
+                        R.id.lockScreen -> {
+                            prefs.lockScreen.set(!prefs.lockScreen.get())
+                            de.asdfghasdfgh.kotozute.glance.GlanceProvider.changed(context)
+                        }
+
+                        R.id.signature -> view.showSignatureDialog(prefs.signature.get())
+
+                        R.id.textSize -> view.showTextSizePicker()
+
+
+
+                        R.id.unicode -> prefs.unicode.set(!prefs.unicode.get())
+
+                        R.id.mobileOnly -> prefs.mobileOnly.set(!prefs.mobileOnly.get())
+
+                        R.id.autoDelete -> view.showAutoDeleteDialog(prefs.autoDelete.get())
+
+                        R.id.longAsMms -> prefs.longAsMms.set(!prefs.longAsMms.get())
+
+                        R.id.mmsSize -> view.showMmsSizePicker()
+
+                        R.id.filePicker -> view.showFilePickerDialog()
+
+                        R.id.setupGuide -> context.startActivity(
+                            de.asdfghasdfgh.kotozute.feature.setup.SetupActivity.intent(context)
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+
+                        R.id.messageLinkHandling -> view.showMessageLinkHandlingDialogPicker()
+
+                        R.id.disableScreenshots -> prefs.disableScreenshots.set(!prefs.disableScreenshots.get())
+
+                        R.id.sync -> syncMessages.execute(Unit)
+
+                    }
+                }
+
+        view.aboutLongClicks()
+                .map { !prefs.logging.get() }
+                .doOnNext { enabled -> prefs.logging.set(enabled) }
+                .autoDisposable(view.scope())
+                .subscribe { enabled ->
+                    context.makeToast(when (enabled) {
+                        true -> R.string.settings_logging_enabled
+                        false -> R.string.settings_logging_disabled
+                    })
+                }
+
+        view.textSizeSelected()
+                .autoDisposable(view.scope())
+                .subscribe(prefs.textSize::set)
+
+        view.sendDelaySelected()
+                .autoDisposable(view.scope())
+                .subscribe(prefs.sendDelay::set)
+
+        view.groupMessagesSelected()
+                .autoDisposable(view.scope())
+                .subscribe { id -> prefs.sendAsGroup.set(id == 0) }
+
+        view.signatureChanged()
+                .doOnNext(prefs.signature::set)
+                .autoDisposable(view.scope())
+                .subscribe()
+
+        view.autoDeleteChanged()
+                .observeOn(Schedulers.io())
+                .filter { maxAge ->
+                    if (maxAge == 0) {
+                        return@filter true
+                    }
+
+                    val counts = messageRepo.getOldMessageCounts(maxAge)
+                    if (counts.values.sum() == 0) {
+                        return@filter true
+                    }
+
+                    runBlocking { view.showAutoDeleteWarningDialog(counts.values.sum()) }
+                }
+                .doOnNext { maxAge ->
+                    when (maxAge == 0) {
+                        true -> AutoDeleteService.cancelJob(context)
+                        false -> {
+                            AutoDeleteService.scheduleJob(context)
+                            deleteOldMessages.execute(Unit)
+                        }
+                    }
+                }
+                .doOnNext(prefs.autoDelete::set)
+                .autoDisposable(view.scope())
+                .subscribe()
+
+        view.mmsSizeSelected()
+                .autoDisposable(view.scope())
+                .subscribe(prefs.mmsSize::set)
+
+        view.messageLinkHandlingSelected()
+            .autoDisposable(view.scope())
+            .subscribe(prefs.messageLinkHandling::set)
+
+        view.desktopSyncResetConfirmed()
+            .autoDisposable(view.scope())
+            .subscribe { DesktopSyncService.forgetAllBrowsers(context, prefs) }
+
+        view.desktopSyncForgetConfirmed()
+            .autoDisposable(view.scope())
+            .subscribe { id -> DesktopSyncService.browsers(context, prefs).remove(id) }
+
+        // Reading an export is thousands of rows and their pictures, so it runs on a thread
+        // of its own and reports as it goes. Not a worker: it needs the folder the picker
+        // just granted this process, and it is over when the reader closes the screen or it
+        // finishes -- there is nothing here worth surviving a restart to resume.
+        // A folder this app wrote cannot be read without its key, so it is asked for before
+        // anything is read rather than after a failure.
+        view.signalExportFolderChosen()
+                .observeOn(Schedulers.io())
+                .map { folder -> folder to signalRepo.needsBackupKeyFromPerson(folder) }
+                .observeOn(AndroidSchedulers.mainThread())
+                .autoDisposable(view.scope())
+                .subscribe { (folder, locked) ->
+                    if (locked) view.askSignalBackupKey(folder) else importHistory(view, folder, "")
+                }
+
+        view.signalBackupKeyEntered()
+                .autoDisposable(view.scope())
+                .subscribe { (folder, key) -> importHistory(view, folder, key) }
+
+        view.signalBackupFolderChosen()
+                .autoDisposable(view.scope())
+                .subscribe { folder ->
+                    Thread {
+                        val stats = runCatching {
+                            signalRepo.exportHistory(folder) { written ->
+                                view.showSignalExportProgress(written)
+                            }
+                        }
+                        view.showSignalExportResult(stats.getOrNull(), stats.exceptionOrNull())
+                        stats.exceptionOrNull()?.let { Timber.w(it, "signal export failed") }
+                    }.apply { isDaemon = true }.start()
+                }
+
+        view.signalUnpairConfirmed()
+            .autoDisposable(view.scope())
+            .subscribe { signalRepo.unpair() }
+
+        view.signalProfileNameEntered()
+            .autoDisposable(view.scope())
+            .subscribe { (given, family) ->
+                // Off the main thread: a profile write is a network call. Reported either
+                // way, because an account whose name did not save looks exactly like one
+                // whose name did from every screen in this app -- the difference is only
+                // visible to the people it writes to.
+                Thread {
+                    val failure = kotlinx.coroutines.runBlocking {
+                        signalRepo.registerSetProfileName(given, family)
+                    }
+                    view.showSignalProfileNameResult(
+                        failure?.let { context.say(SignalWording.profileName(it)) }
+                    )
+                }.apply { isDaemon = true }.start()
+            }
+
+        view.signalFetchContactsConfirmed()
+            .autoDisposable(view.scope())
+            .subscribe { fetchContacts(view) }
+
+        view.signalDiscoverContactsConfirmed()
+            .autoDisposable(view.scope())
+            .subscribe { discoverContacts(view) }
+    }
+
+    /**
+     * Offers the contact fetch the first time this screen is opened on a phone that needs it.
+     *
+     * Off the main thread: deciding reads the protocol database. Marked as offered when the
+     * offer is made rather than when it is answered -- "no" is an answer, and asking again
+     * because somebody said no is how a prompt becomes a nuisance.
+     */
+    private fun offerContactFetchOnce(view: SettingsView) {
+        if (prefs.signalContactsOffered.get()) return
+        Thread {
+            if (runCatching { signalRepo.shouldOfferContactFetch() }.getOrDefault(false)) {
+                prefs.signalContactsOffered.set(true)
+                view.askFetchContacts()
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** The fetch itself, shared by the settings row and the one-off offer. */
+    private fun fetchContacts(view: SettingsView) {
+        Thread {
+            view.showSignalFetchResult(
+                runCatching { context.say(SignalWording.contacts(signalRepo.fetchContactsFromSignal())) }
+                    .getOrElse { failure ->
+                        Timber.w(failure, "signal contacts: fetch failed")
+                        context.getString(R.string.settings_signal_fetch_contacts_failed)
+                    }
+            )
+        }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * The lookup itself, off the main thread: it reads the whole address book and then waits
+     * on an enclave round trip.
+     */
+    private fun discoverContacts(view: SettingsView) {
+        Thread {
+            view.showSignalFetchResult(
+                runCatching { context.say(SignalWording.contacts(signalRepo.discoverContactsByNumber())) }
+                    .getOrElse { failure ->
+                        Timber.w(failure, "signal discovery: the lookup failed")
+                        context.getString(R.string.settings_signal_discover_contacts_failed)
+                    }
+            )
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun importHistory(view: SettingsView, folder: String, key: String) {
+        Thread {
+            val stats = runCatching {
+                signalRepo.importHistory(folder, key) { taken ->
+                    view.showSignalImportProgress(taken)
+                }
+            }
+            when (val failure = stats.exceptionOrNull()) {
+                null -> view.showSignalImportResult(stats.getOrNull())
+                is SignalRepository.WrongBackupKey -> view.showSignalBackupKeyWrong(folder)
+                is SignalRepository.BackupKeyNeeded -> view.askSignalBackupKey(folder)
+                // ⚠ These two were one answer, and the answer was "there is no Signal export
+                // in that folder" -- said whether the folder held no export or held one that
+                // could not be read. A person whose export is sitting right there is then
+                // told the only thing they know to be false, and has nothing left to try.
+                is SignalRepository.NotAnExport -> view.showSignalImportResult(null)
+                else -> {
+                    Timber.w(failure, "signal import failed")
+                    view.showSignalImportResult(null, failure)
+                }
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+
+    /**
+     * Say what is actually true. Receiving degrades softly -- messages queue on Signal's
+     * servers while the phone is away -- but sending simply cannot happen, so the line
+     * names read-only rather than implying something is on its way.
+     */
+    private fun signalStatusSummary(conn: SignalRepository.ConnectionState): String {
+        val last = when (val t = conn.lastSyncedAt) {
+            0L -> context.getString(R.string.settings_signal_status_never)
+            else -> context.getString(
+                R.string.settings_signal_status_last_synced,
+                DateUtils.getRelativeTimeSpanString(t).toString()
+            )
+        }
+
+        // The direct rail does not sync; it holds a socket open and messages arrive on it. So
+        // the timestamp means "when something last came through", and the wording follows --
+        // "Last synced" describes a poll that does not happen here. And when nothing has come
+        // through yet, that is not a fault worth reporting: a quiet account looks exactly the
+        // same as a broken one from here, so this says nothing rather than something wrong.
+        val received = when (val t = conn.lastSyncedAt) {
+            0L -> ""
+            else -> " · " + context.getString(
+                R.string.settings_signal_status_last_received,
+                DateUtils.getRelativeTimeSpanString(t).toString()
+            )
+        }
+        // Envelopes that arrived and could not be decrypted. Kept rather than dropped -- they
+        // were acknowledged, so the ciphertext is the only copy left -- and surfaced here
+        // because a release build logs nothing, and this count is the one early sign of a
+        // message shape the app cannot yet read.
+        val stuck = conn.undecryptable
+            .takeIf { it > 0 }
+            ?.let {
+                // The reason as well as the count. A number alone is a report nobody can act
+                // on, and this is the only channel a release build has.
+                val why = conn.undecryptableReasons.firstOrNull()?.let { r -> " ($r)" }.orEmpty()
+                " · " + context.getString(R.string.settings_signal_status_stuck, it) + why
+            }
+            .orEmpty()
+
+        // A phone that is its own Signal device has nothing between it and the server to be
+        // unreachable or to refuse it, and saying otherwise sends somebody off to re-pair
+        // something that does not exist.
+        // Contacts, on the direct rail only. Names come from profiles, and whether a profile
+        // key has arrived is invisible from the outside -- this is the only way to tell
+        // "nobody has shared one" apart from "the fetch is broken".
+        val who = conn.contactCounts
+            ?.let { " · " + context.say(SignalWording.contactCounts(it)) }
+            .orEmpty()
+
+        // First, when it applies: it is the warning that comes before this phone is unlinked,
+        // and the only fix is on the other phone. Signal shows it as a banner every week;
+        // this line is where this app says how the account is.
+        val idle = if (conn.primaryIdle) {
+            context.getString(R.string.settings_signal_status_primary_idle) + " · "
+        } else {
+            ""
+        }
+
+        return when {
+            // A refusal is the one status that is not going to fix itself, so it replaces the
+            // line rather than decorating it. Saying "offline" here would be true and useless:
+            // the phone is offline because the account no longer has it, and only its owner
+            // can change that.
+            !conn.rejected.isNullOrBlank() -> conn.rejected.orEmpty()
+            // Before "offline", because it says whose fault the offline is. Only ever set by
+            // Signal's own status check, never guessed from a failure here.
+            !conn.signalConnected && conn.serviceOutage ->
+                idle + context.getString(R.string.settings_signal_status_outage) + received + stuck + who
+            !conn.signalConnected ->
+                idle + context.getString(R.string.settings_signal_status_direct_offline) + received + stuck + who
+            else ->
+                idle + context.getString(R.string.settings_signal_status_direct_ok) + received + stuck + who
+        }
+    }
+
+    /**
+     * One line, not a paragraph. The address moved into its own row + dialog: it only
+     * matters while you're setting the dashboard up, and printing a URL with a secret
+     * token in it on every visit to Settings is noise the rest of the time.
+     */
+    private fun desktopSyncSummary(enabled: Boolean): String {
+        if (!enabled) {
+            // Off without the user: a start that failed. Say so, and why, until the next start.
+            val failure = prefs.desktopSyncFailure.get()
+            if (failure.isNotEmpty()) return context.getString(R.string.settings_desktop_sync_summary_failed, failure)
+            return context.getString(R.string.settings_desktop_sync_summary_off)
+        }
+        // "enabled" is the persisted intent; isRunning is whether a server is really
+        // bound. They differ while a restart is on its way, so report honestly.
+        if (!DesktopSyncService.isRunning) {
+            return context.getString(R.string.settings_desktop_sync_summary_starting)
+        }
+        val vpn = DesktopSyncService.findVpnAddress(context)
+        if (prefs.desktopSyncVpnOnly.get() && vpn == null) {
+            return context.getString(R.string.settings_desktop_sync_summary_no_vpn)
+        }
+        if (vpn == null && DesktopSyncService.findLanAddress(context) == null) {
+            return context.getString(R.string.settings_desktop_sync_summary_no_network)
+        }
+        return context.getString(R.string.settings_desktop_sync_summary_on)
+    }
+
+    /**
+     * Every address the computer could open, labelled, or empty if nothing can reach this
+     * phone right now. All of them rather than one: the relay binds every interface, and
+     * which address the computer can see is not knowable from here. Under the VPN
+     * restriction only VPN addresses are offered, because the others answer 403.
+     */
+    private fun desktopSyncUrls(): List<Pair<String, String>> {
+        return DesktopSyncService.reachableAddresses(context)
+            .filter {
+                !prefs.desktopSyncVpnOnly.get() ||
+                    it.first in DesktopSyncService.VPN_LABELS
+            }
+            .map { (label, host) ->
+                label to DesktopSyncService.linkUrl(prefs.desktopSyncTls.get(), host, DesktopSyncService.PORT)
+            }
+    }
+
+
+}

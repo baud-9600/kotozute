@@ -17,7 +17,7 @@
   ~ You should have received a copy of the GNU General Public License
   ~ along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
   -->
-<com.wanderwildwood.kotozute.common.widget.PagingScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<de.asdfghasdfgh.kotozute.common.widget.PagingScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/contentView"
@@ -40,24 +40,24 @@
             android:layout_height="wrap_content"
             android:orientation="vertical">
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/archived"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/drawer_archived" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/scheduled"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/drawer_scheduled" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/blocking"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/drawer_blocking" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/notifications"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -65,31 +65,31 @@
 
             <include layout="@layout/preference_divider" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/categoryDisplay"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_category_general" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/categorySending"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_category_sending" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/categoryStorage"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_category_storage" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/categoryDesktopSync"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_category_desktop_sync" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/categorySignal"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -102,7 +102,7 @@
               ~ app does, which is the same reason About sits off in the menu.
               -->
             <!-- Brings back the texting line that the SMS list's Hide put away. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/askDefaultSms"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -110,7 +110,7 @@
                 app:title="@string/settings_ask_default_sms_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/setupGuide"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -125,20 +125,20 @@
             android:orientation="vertical"
             android:visibility="gone">
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/textSize"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_text_size_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/unreadAtTop"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_unread_at_top_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/allOnlyPeople"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -146,7 +146,7 @@
                 app:title="@string/settings_all_only_people_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/keepMutedArchived"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -154,14 +154,14 @@
                 app:title="@string/settings_keep_muted_archived_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/lockScreen"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_lock_screen_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/swipeActions"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -177,32 +177,32 @@
             android:orientation="vertical"
             android:visibility="gone">
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signature"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_signature_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/delayed"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_delayed_title"
                 tools:summary="No delay" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/groupMessages"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_group_messages_title"
                 tools:summary="One group chat" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/delivery"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_delivery_title"
                 app:widget="@layout/settings_switch_widget" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/readReceipts"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -210,7 +210,7 @@
                 app:title="@string/settings_read_receipts_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/longAsMms"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -218,21 +218,21 @@
                 app:title="@string/settings_long_as_mms_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/unicode"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_unicode_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/mobileOnly"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_mobile_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/mmsSize"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -240,7 +240,7 @@
                 app:title="@string/settings_mms_size_title"
                 tools:summary="100KB" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/filePicker"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -256,38 +256,38 @@
             android:orientation="vertical"
             android:visibility="gone">
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/backup"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/backup_title" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/crashLog"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:summary="@string/settings_crash_log_summary"
                 app:title="@string/settings_crash_log_title" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/sync"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:summary="@string/settings_sync_summary"
                 app:title="@string/settings_sync_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/messageLinkHandling"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:visibility="visible"
                 app:title="@string/settings_mms_weblink_title"
                 tools:summary="100KB" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/disableScreenshots"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 app:title="@string/settings_disable_screenshots_title"
                 app:widget="@layout/settings_switch_widget" />
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/autoDelete"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -303,7 +303,7 @@
             android:orientation="vertical"
             android:visibility="gone">
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/desktopSync"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -311,7 +311,7 @@
                 app:title="@string/settings_desktop_sync_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/desktopSyncLink"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -324,7 +324,7 @@
                 hand it the microphone. The summary says what it costs, because it costs
                 something visible every single visit.
             -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/desktopSyncTls"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -333,7 +333,7 @@
                 app:title="@string/settings_desktop_sync_tls_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/desktopSyncVpnOnly"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -342,14 +342,14 @@
                 app:title="@string/settings_desktop_sync_vpn_only_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/desktopSyncBrowsers"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:visibility="gone"
                 app:title="@string/settings_desktop_sync_browsers_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/desktopSyncReset"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -371,7 +371,7 @@
               second computer, so it is the one to meet first; the bridge stays for anyone
               already using one.
             -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalLink"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -381,7 +381,7 @@
             <!-- The second way in, for someone with no other phone to link to. Below linking
                  because almost everyone has the other phone, and above the bridge because
                  this one is a real answer rather than a legacy path. -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalRegister"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -392,7 +392,7 @@
 
             
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalEnabled"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -401,7 +401,7 @@
                 app:title="@string/settings_signal_enabled_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalOpen"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -409,7 +409,7 @@
                 app:summary="@string/settings_signal_open_summary"
                 app:title="@string/settings_signal_open_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalHistoryImport"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -417,7 +417,7 @@
                 app:summary="@string/settings_signal_import_summary"
                 app:title="@string/settings_signal_import_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalHistoryExport"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -425,7 +425,7 @@
                 app:summary="@string/settings_signal_export_summary"
                 app:title="@string/settings_signal_export_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalAccount"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -433,7 +433,7 @@
                 app:summary="@string/settings_signal_account_summary"
                 app:title="@string/settings_signal_account_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalDevices"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -450,7 +450,7 @@
                 nameless for ever with nothing on this screen to say so, while everybody it
                 wrote to saw a bare service id.
             -->
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalProfileName"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -458,7 +458,7 @@
                 app:summary="@string/settings_signal_profile_name_summary"
                 app:title="@string/settings_signal_profile_name_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalKeepConnected"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -467,7 +467,7 @@
                 app:title="@string/settings_signal_keep_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalWeave"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -476,7 +476,7 @@
                 app:title="@string/settings_signal_weave_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalOpensFirst"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -485,7 +485,7 @@
                 app:title="@string/settings_signal_opens_first_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalReceipts"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -494,7 +494,7 @@
                 app:title="@string/settings_signal_receipts_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalTyping"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -503,7 +503,7 @@
                 app:title="@string/settings_signal_typing_title"
                 app:widget="@layout/settings_switch_widget" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalAbout"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -511,7 +511,7 @@
                 app:summary="@string/settings_signal_about_summary"
                 app:title="@string/settings_signal_about_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalUsername"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -519,7 +519,7 @@
                 app:summary="@string/settings_signal_username_summary"
                 app:title="@string/settings_signal_username_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalNumberPrivacy"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -527,7 +527,7 @@
                 app:summary="@string/settings_signal_number_summary"
                 app:title="@string/settings_signal_number_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalNotificationsOff"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -535,7 +535,7 @@
                 app:summary="@string/settings_signal_notifications_off_summary"
                 app:title="@string/settings_signal_notifications_off_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalFullScreenCalls"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -543,7 +543,7 @@
                 app:summary="@string/settings_signal_fullscreen_summary"
                 app:title="@string/settings_signal_fullscreen_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalBackground"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -551,7 +551,7 @@
                 app:summary="@string/settings_signal_background_summary"
                 app:title="@string/settings_signal_background_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalFetchContacts"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -559,7 +559,7 @@
                 app:summary="@string/settings_signal_fetch_contacts_summary"
                 app:title="@string/settings_signal_fetch_contacts_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalDiscoverContacts"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -567,7 +567,7 @@
                 app:summary="@string/settings_signal_discover_contacts_summary"
                 app:title="@string/settings_signal_discover_contacts_title" />
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalStatus"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -576,7 +576,7 @@
 
             
 
-            <com.wanderwildwood.kotozute.common.widget.PreferenceView
+            <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
                 android:id="@+id/signalUnpair"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -588,4 +588,4 @@
 
     </LinearLayout>
 
-</com.wanderwildwood.kotozute.common.widget.PagingScrollView>
+</de.asdfghasdfgh.kotozute.common.widget.PagingScrollView>

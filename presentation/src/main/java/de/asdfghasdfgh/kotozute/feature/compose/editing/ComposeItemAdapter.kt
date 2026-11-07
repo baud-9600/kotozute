@@ -1,0 +1,315 @@
+/*
+ * Copyright (C) 2019 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.compose.editing
+
+import android.view.LayoutInflater
+import android.view.ViewGroup
+import androidx.core.view.isVisible
+import androidx.recyclerview.widget.RecyclerView
+import de.asdfghasdfgh.kotozute.R
+import de.asdfghasdfgh.kotozute.common.base.QkAdapter
+import de.asdfghasdfgh.kotozute.common.base.QkBindingViewHolder
+import de.asdfghasdfgh.kotozute.common.util.Colors
+import de.asdfghasdfgh.kotozute.common.util.extensions.forwardTouches
+import de.asdfghasdfgh.kotozute.common.util.extensions.resolveThemeColor
+import de.asdfghasdfgh.kotozute.common.util.extensions.setTint
+import de.asdfghasdfgh.kotozute.extensions.associateByNotNull
+import de.asdfghasdfgh.kotozute.model.Contact
+import de.asdfghasdfgh.kotozute.model.ContactGroup
+import de.asdfghasdfgh.kotozute.model.Conversation
+import de.asdfghasdfgh.kotozute.model.Recipient
+import de.asdfghasdfgh.kotozute.repository.ConversationRepository
+import io.reactivex.disposables.CompositeDisposable
+import io.reactivex.rxkotlin.plusAssign
+import io.reactivex.subjects.PublishSubject
+import io.reactivex.subjects.Subject
+import javax.inject.Inject
+import de.asdfghasdfgh.kotozute.databinding.ContactListItemBinding
+
+class ComposeItemAdapter @Inject constructor(
+    private val colors: Colors,
+    private val conversationRepo: ConversationRepository
+) : QkAdapter<ComposeItem, QkBindingViewHolder<ContactListItemBinding>>() {
+
+    val clicks: Subject<ComposeItem> = PublishSubject.create()
+    val longClicks: Subject<ComposeItem> = PublishSubject.create()
+
+    private val numbersViewPool = RecyclerView.RecycledViewPool()
+    private val disposables = CompositeDisposable()
+
+    var recipients: Map<String, Recipient> = mapOf()
+        set(value) {
+            field = value
+            notifyDataSetChanged()
+        }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): QkBindingViewHolder<ContactListItemBinding> {
+        val layoutInflater = LayoutInflater.from(parent.context)
+        val binding = ContactListItemBinding.inflate(layoutInflater, parent, false)
+        val view = binding.root
+
+        binding.icon.setTint(colors.theme().theme)
+
+        binding.numbers.setRecycledViewPool(numbersViewPool)
+        binding.numbers.adapter = PhoneNumberAdapter()
+        binding.numbers.forwardTouches(view)
+
+        return QkBindingViewHolder(binding).apply {
+            view.setOnClickListener {
+                val item = getItem(adapterPosition)
+                // A heading is not a choice.
+                if (item is ComposeItem.SignalHeader) return@setOnClickListener
+                clicks.onNext(item)
+            }
+            view.setOnLongClickListener {
+                val item = getItem(adapterPosition)
+                longClicks.onNext(item)
+                true
+            }
+        }
+    }
+
+    override fun onBindViewHolder(holder: QkBindingViewHolder<ContactListItemBinding>, position: Int) {
+        val prevItem = if (position > 0) getItem(position - 1) else null
+        // Holders are recycled, and the heading below paints its title grey. Without this a
+        // person would inherit that grey from whichever row this view used to be.
+        holder.binding.title.setTextColor(
+            holder.itemView.context.resolveThemeColor(android.R.attr.textColorPrimary)
+        )
+        when (val item = getItem(position)) {
+            is ComposeItem.New -> bindNew(holder, item.value)
+            is ComposeItem.Recent -> bindRecent(holder, item.value, prevItem)
+            is ComposeItem.Starred -> bindStarred(holder, item.value, prevItem)
+            is ComposeItem.Person -> bindPerson(holder, item.value, prevItem)
+            is ComposeItem.Group -> bindGroup(holder, item.value, prevItem)
+            is ComposeItem.SignalPerson -> bindSignalPerson(holder, item, prevItem)
+            is ComposeItem.SignalHeader -> bindSignalHeader(holder)
+            is ComposeItem.SignalNewGroup -> bindSignalNewGroup(holder)
+            is ComposeItem.SignalFindUsername -> bindSignalFindUsername(holder)
+        }
+    }
+
+    /**
+     * Making a group rather than choosing somebody.
+     *
+     * It carries a mark where the others carry a face, because it is not a person and a
+     * blank in that column would read as one whose picture had not loaded.
+     */
+    private fun bindSignalNewGroup(holder: QkBindingViewHolder<ContactListItemBinding>) {
+        holder.binding.index.isVisible = false
+        holder.binding.icon.isVisible = true
+        holder.binding.icon.setImageResource(R.drawable.ic_people_black_24dp)
+        holder.binding.avatar.recipients = emptyList()
+        holder.binding.title.text =
+            holder.itemView.context.getString(R.string.signal_group_title)
+        holder.binding.subtitle.isVisible = false
+        holder.binding.numbers.isVisible = false
+    }
+
+    private fun bindSignalFindUsername(holder: QkBindingViewHolder<ContactListItemBinding>) {
+        holder.binding.index.isVisible = false
+        holder.binding.icon.isVisible = true
+        holder.binding.icon.setImageResource(R.drawable.ic_search_black_24dp)
+        holder.binding.avatar.recipients = emptyList()
+        holder.binding.title.text =
+            holder.itemView.context.getString(R.string.signal_find_username)
+        holder.binding.subtitle.isVisible = false
+        holder.binding.numbers.isVisible = false
+    }
+
+    /**
+     * Says what the rows below it are. Not a row anybody can choose.
+     *
+     * In the quieter grey the second line uses, not the black a name is set in: bold and
+     * black beside an empty index column reads as somebody called "On Signal".
+     */
+    private fun bindSignalHeader(holder: QkBindingViewHolder<ContactListItemBinding>) {
+        holder.binding.index.isVisible = false
+        holder.binding.icon.isVisible = false
+        holder.binding.avatar.recipients = emptyList()
+        holder.binding.title.text = holder.itemView.context.getString(R.string.compose_signal_header)
+        holder.binding.title.setTextColor(
+            holder.itemView.context.resolveThemeColor(android.R.attr.textColorTertiary)
+        )
+        holder.binding.subtitle.isVisible = false
+        holder.binding.numbers.isVisible = false
+    }
+
+    /**
+     * A person on the Signal rail. The row says so on its second line, because the same name
+     * can be in the list twice -- once for each rail -- and which one is being chosen is the
+     * whole of the difference between the two rows.
+     */
+    private fun bindSignalPerson(
+        holder: QkBindingViewHolder<ContactListItemBinding>,
+        person: ComposeItem.SignalPerson,
+        prev: ComposeItem?
+    ) {
+        holder.binding.index.isVisible = false
+
+        holder.binding.icon.isVisible = false
+
+        holder.binding.avatar.recipients = listOf(Recipient(address = person.number))
+
+        holder.binding.title.text = person.name
+
+        holder.binding.subtitle.isVisible = true
+        holder.binding.subtitle.text = when {
+            // Not when the row is already showing the number as its name: "Signal ·
+            // +15550148" under "+15550148" is the same fact twice.
+            person.number.isNotBlank() && person.number != person.name ->
+                holder.itemView.context.getString(R.string.compose_signal_person_number, person.number)
+            else -> holder.itemView.context.getString(R.string.compose_signal_person)
+        }
+        holder.binding.subtitle.collapseEnabled = false
+
+        holder.binding.numbers.isVisible = false
+    }
+
+    private fun bindNew(holder: QkBindingViewHolder<ContactListItemBinding>, contact: Contact) {
+        holder.binding.index.isVisible = false
+
+        holder.binding.icon.isVisible = false
+
+        holder.binding.avatar.recipients = listOf(createRecipient(contact))
+
+        holder.binding.title.text = contact.numbers.joinToString { it.address }
+
+        holder.binding.subtitle.isVisible = false
+
+        holder.binding.numbers.isVisible = false
+    }
+
+    private fun bindRecent(holder: QkBindingViewHolder<ContactListItemBinding>, conversation: Conversation, prev: ComposeItem?) {
+        holder.binding.index.isVisible = false
+
+        holder.binding.icon.isVisible = prev !is ComposeItem.Recent
+        holder.binding.icon.setImageResource(R.drawable.ic_history_black_24dp)
+
+        holder.binding.avatar.recipients = conversation.recipients
+
+        holder.binding.title.text = conversation.getTitle()
+
+        holder.binding.subtitle.isVisible = conversation.recipients.size > 1 && conversation.name.isBlank()
+        holder.binding.subtitle.text = conversation.recipients.joinToString(", ") { recipient ->
+            recipient.contact?.name ?: recipient.address
+        }
+        holder.binding.subtitle.collapseEnabled = conversation.recipients.size > 1
+
+        holder.binding.numbers.isVisible = conversation.recipients.size == 1
+        (holder.binding.numbers.adapter as PhoneNumberAdapter).data = conversation.recipients
+                .mapNotNull { recipient -> recipient.contact }
+                .flatMap { contact -> contact.numbers }
+    }
+
+    private fun bindStarred(holder: QkBindingViewHolder<ContactListItemBinding>, contact: Contact, prev: ComposeItem?) {
+        holder.binding.index.isVisible = false
+
+        holder.binding.icon.isVisible = prev !is ComposeItem.Starred
+        holder.binding.icon.setImageResource(R.drawable.ic_star_black_24dp)
+
+        holder.binding.avatar.recipients = listOf(createRecipient(contact))
+
+        holder.binding.title.text = contact.name
+
+        holder.binding.subtitle.isVisible = false
+
+        holder.binding.numbers.isVisible = true
+        (holder.binding.numbers.adapter as PhoneNumberAdapter).data = contact.numbers
+    }
+
+    private fun bindGroup(holder: QkBindingViewHolder<ContactListItemBinding>, group: ContactGroup, prev: ComposeItem?) {
+        holder.binding.index.isVisible = false
+
+        holder.binding.icon.isVisible = prev !is ComposeItem.Group
+        holder.binding.icon.setImageResource(R.drawable.ic_people_black_24dp)
+
+        holder.binding.avatar.recipients = group.contacts.map(::createRecipient)
+
+        holder.binding.title.text = group.title
+
+        holder.binding.subtitle.isVisible = true
+        holder.binding.subtitle.text = group.contacts.joinToString(", ") { it.name }
+        holder.binding.subtitle.collapseEnabled = group.contacts.size > 1
+
+        holder.binding.numbers.isVisible = false
+    }
+
+    private fun bindPerson(holder: QkBindingViewHolder<ContactListItemBinding>, contact: Contact, prev: ComposeItem?) {
+        holder.binding.index.isVisible = true
+        holder.binding.index.text = if (contact.name.getOrNull(0)?.isLetter() == true) contact.name[0].toString() else "#"
+        holder.binding.index.isVisible = prev !is ComposeItem.Person ||
+                (contact.name[0].isLetter() && !contact.name[0].equals(prev.value.name[0], ignoreCase = true)) ||
+                (!contact.name[0].isLetter() && prev.value.name[0].isLetter())
+
+        holder.binding.icon.isVisible = false
+
+        holder.binding.avatar.recipients = listOf(createRecipient(contact))
+
+        holder.binding.title.text = contact.name
+
+        holder.binding.subtitle.isVisible = false
+
+        holder.binding.numbers.isVisible = true
+        (holder.binding.numbers.adapter as PhoneNumberAdapter).data = contact.numbers
+    }
+
+    private fun createRecipient(contact: Contact): Recipient {
+        return recipients[contact.lookupKey] ?: Recipient(
+            address = contact.numbers.firstOrNull()?.address ?: "",
+            contact = contact)
+    }
+
+    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
+        disposables += conversationRepo.getUnmanagedRecipients()
+                .map { recipients -> recipients.associateByNotNull { recipient -> recipient.contact?.lookupKey } }
+                .subscribe { recipients -> this@ComposeItemAdapter.recipients = recipients }
+    }
+
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        disposables.clear()
+    }
+
+    override fun areItemsTheSame(old: ComposeItem, new: ComposeItem): Boolean {
+        // A Signal person has no contacts to be identified by, so every one of them would
+        // otherwise look like the same item as every other -- and as any other empty row.
+        if (old is ComposeItem.SignalHeader || new is ComposeItem.SignalHeader) {
+            return old is ComposeItem.SignalHeader && new is ComposeItem.SignalHeader
+        }
+        if (old is ComposeItem.SignalNewGroup || new is ComposeItem.SignalNewGroup) {
+            return old is ComposeItem.SignalNewGroup && new is ComposeItem.SignalNewGroup
+        }
+        if (old is ComposeItem.SignalFindUsername || new is ComposeItem.SignalFindUsername) {
+            return old is ComposeItem.SignalFindUsername && new is ComposeItem.SignalFindUsername
+        }
+        if (old is ComposeItem.SignalPerson || new is ComposeItem.SignalPerson) {
+            return old is ComposeItem.SignalPerson && new is ComposeItem.SignalPerson &&
+                    old.threadKey == new.threadKey
+        }
+
+        val oldIds = old.getContacts().map { contact -> contact.lookupKey }
+        val newIds = new.getContacts().map { contact -> contact.lookupKey }
+        return oldIds == newIds
+    }
+
+    override fun areContentsTheSame(old: ComposeItem, new: ComposeItem): Boolean {
+        return false
+    }
+
+}

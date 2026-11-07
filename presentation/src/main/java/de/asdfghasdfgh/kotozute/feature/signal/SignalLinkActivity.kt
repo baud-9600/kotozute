@@ -1,0 +1,154 @@
+package de.asdfghasdfgh.kotozute.feature.signal
+
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.os.Bundle
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import de.asdfghasdfgh.kotozute.R
+import de.asdfghasdfgh.kotozute.common.base.QkThemedActivity
+import de.asdfghasdfgh.kotozute.databinding.SignalLinkActivityBinding
+import de.asdfghasdfgh.kotozute.repository.SignalRepository
+import de.asdfghasdfgh.kotozute.feature.desktopsync.DesktopSyncService
+import de.asdfghasdfgh.kotozute.feature.desktopsync.SignalLinkOffer
+import dagger.android.AndroidInjection
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Links this phone to a Signal account by showing a code for another device to scan.
+ *
+ * The same exchange Molly and Signal Desktop perform, and the point of the whole branch: once
+ * it completes there is no bridge in the path.
+ *
+ * The screen stays open for the duration on purpose. The provisioning socket lives about
+ * ninety seconds and dies with the scope that holds it, so a code shown and then navigated
+ * away from is a code that has already stopped working -- which would read as "the scan
+ * failed" rather than "you left".
+ */
+class SignalLinkActivity : QkThemedActivity() {
+
+    @Inject lateinit var signalRepo: SignalRepository
+
+    private lateinit var binding: SignalLinkActivityBinding
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        AndroidInjection.inject(this)
+        super.onCreate(savedInstanceState)
+        binding = SignalLinkActivityBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        title = getString(R.string.signal_link_title)
+        showBackButton(true)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val result = signalRepo.linkDevice(
+                deviceName = android.os.Build.MODEL ?: "kotozute",
+                onUrl = { url -> CoroutineScope(Dispatchers.Main).launch { show(url) } }
+            )
+            withContext(Dispatchers.Main) {
+                binding.status.text = when (result) {
+                    null -> getString(R.string.signal_link_expired)
+                    is SignalRepository.Link.Linked -> getString(R.string.signal_link_success)
+                    is SignalRepository.Link.Failed ->
+                        getString(R.string.signal_link_failed, say(SignalWording.link(result.failure)))
+                }
+            }
+        }
+    }
+
+    private fun show(url: String) {
+        // Never logged, and never written down. This string is a live offer to join the
+        // account -- whoever redeems it first becomes a device on it -- so it exists on this
+        // screen, and, while this screen is open, on the page this phone serves to its
+        // owner's own computer. Nowhere else, and not for a second longer. See
+        // [SignalLinkOffer] for why the computer has to be offered it at all.
+        binding.qr.setImageBitmap(qrOf(url))
+        binding.status.setText(R.string.signal_link_waiting)
+        SignalLinkOffer.offer(url)
+        showComputerRoute()
+        // The phone that already runs Signal cannot scan a code it is showing. Signal opens
+        // its own link-device links, so hand it this one directly instead of a screenshot.
+        val open = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+        val handled = packageManager.resolveActivity(open, 0) != null
+        binding.openInSignal.visibility = if (handled) android.view.View.VISIBLE else android.view.View.GONE
+        binding.openInSignal.setOnClickListener {
+            runCatching { startActivity(open) }
+        }
+    }
+
+    /**
+     * Where to read this code if the phone in your hand is the one already running Signal.
+     *
+     * Shown only when Desktop Sync is on and has an address to give, because the sentence is
+     * useless otherwise -- and a phone with no computer on its VPN still has the QR and
+     * a second phone, which is the ordinary way in.
+     */
+    private fun showComputerRoute() {
+        if (!prefs.desktopSyncEnabled.get()) return
+        // Only where a browser is paired to open it; the address carries no token.
+        if (DesktopSyncService.browsers(this, prefs).list().isEmpty()) return
+        val address = DesktopSyncService.reachableAddresses(this)
+            .filter {
+                !prefs.desktopSyncVpnOnly.get() ||
+                    it.first in DesktopSyncService.VPN_LABELS
+            }
+            .map { (_, host) ->
+                DesktopSyncService.linkUrl(prefs.desktopSyncTls.get(), host, DesktopSyncService.PORT, "/signal-link")
+            }
+            .firstOrNull() ?: return
+        binding.onComputer.text = getString(R.string.signal_link_on_computer, address)
+        binding.onComputer.visibility = android.view.View.VISIBLE
+    }
+
+    /**
+     * ⚠ The code stops being offered when this screen goes, not when it expires. The socket
+     * behind it dies with this activity's scope anyway, so a code left on the page after that
+     * would be a live-looking offer that cannot be redeemed -- and a secret kept past its use.
+     */
+    override fun onDestroy() {
+        SignalLinkOffer.offer(null)
+        super.onDestroy()
+    }
+
+    /**
+     * A black-and-white bitmap, deliberately without a margin quiet zone of its own beyond the
+     * minimum: the screen this renders on is small, and every module of the code has to be
+     * large enough for another phone's camera to resolve off a low-contrast panel.
+     */
+    private fun qrOf(text: String): Bitmap {
+        val size = 512
+        val matrix = QRCodeWriter().encode(
+            text,
+            BarcodeFormat.QR_CODE,
+            size,
+            size,
+            mapOf(
+                // A linking URL is long, and the correction level trades capacity against
+                // readability. L keeps the modules as large as possible, which matters more
+                // than redundancy for a code being read once, from a screen, immediately.
+                EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.L,
+                EncodeHintType.MARGIN to 1
+            )
+        )
+        return Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565).apply {
+            for (x in 0 until size) {
+                for (y in 0 until size) {
+                    setPixel(x, y, if (matrix.get(x, y)) Color.BLACK else Color.WHITE)
+                }
+            }
+        }
+    }
+
+    companion object {
+        fun intent(context: Context) = Intent(context, SignalLinkActivity::class.java)
+    }
+}

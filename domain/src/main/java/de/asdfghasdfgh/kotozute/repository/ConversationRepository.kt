@@ -1,0 +1,113 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.repository
+
+import de.asdfghasdfgh.kotozute.model.Conversation
+import de.asdfghasdfgh.kotozute.model.Recipient
+import de.asdfghasdfgh.kotozute.model.SearchResult
+import io.reactivex.Completable
+import io.reactivex.Observable
+import io.realm.RealmResults
+
+interface ConversationRepository {
+
+    fun getConversations(unreadAtTop: Boolean, archived: Boolean = false): RealmResults<Conversation>
+
+    fun getGroupConversations(unreadAtTop: Boolean, archived: Boolean = false): RealmResults<Conversation>
+
+    fun getUnknownConversations(unreadAtTop: Boolean, archived: Boolean = false): RealmResults<Conversation>
+
+    /**
+     * [archived] selects which shelf. It used to be fixed at the inbox, which meant a
+     * caller that wanted the archive silently got the inbox filtered down to nothing.
+     */
+    fun getConversationsSnapshot(unreadAtTop: Boolean, archived: Boolean = false): List<Conversation>
+
+    fun getTopConversations(): List<Conversation>
+
+    fun setConversationName(id: Long, name: String): Completable
+
+    fun searchConversations(query: CharSequence): List<SearchResult>
+
+    fun getBlockedConversations(): RealmResults<Conversation>
+
+    /**
+     * The same list, detached and with the Realm closed behind it -- getBlockedConversations
+     * leaves one open, which a screen that lives as long as its Realm survives and a caller
+     * on a fresh worker thread per request does not.
+     */
+    fun getBlockedConversationsSnapshot(): List<Conversation>
+
+    fun getBlockedConversationsAsync(): RealmResults<Conversation>
+
+    fun getConversationAsync(threadId: Long): Conversation
+
+    fun getConversation(threadId: Long): Conversation?
+
+    fun updateSendAsGroup(threadId: Long, sendAsGroup: Boolean): Unit?
+
+    fun getUnseenIds(archived: Boolean = false): List<Long>
+
+    fun getUnreadIds(archived: Boolean = false): List<Long>
+
+    fun getConversationAndLastSenderContactName(threadId: Long): Pair<Conversation?, String?>?
+
+    fun getConversations(vararg threadIds: Long): RealmResults<Conversation>
+
+    fun getUnmanagedConversations(): Observable<List<Conversation>>
+
+    fun getRecipients(): RealmResults<Recipient>
+
+    fun getUnmanagedRecipients(): Observable<List<Recipient>>
+
+    fun getRecipient(recipientId: Long): Recipient?
+
+    fun getOrCreateConversation(threadId: Long, sendAsGroup: Boolean = true): Conversation?
+
+    fun createConversation(threadId: Long, sendAsGroup: Boolean = true): Conversation?
+
+    fun getConversation(addresses: Collection<String>): Conversation?
+
+    fun getOrCreateConversation(
+        addresses: Collection<String>, sendAsGroup: Boolean = true
+    ): Conversation?
+
+    fun createConversation(
+        addresses: Collection<String>, sendAsGroup: Boolean = true
+    ): Conversation?
+
+    fun saveDraft(threadId: Long, draft: String)
+
+    fun updateConversations(threadIds: Collection<Long>)
+
+    fun markArchived(vararg threadIds: Long)
+
+    fun markUnarchived(threadIds: Collection<Long>)
+
+    fun markPinned(vararg threadIds: Long)
+
+    fun markUnpinned(vararg threadIds: Long)
+
+    fun markBlocked(threadIds: Collection<Long>, blockingClient: Int, blockReason: String?)
+
+    fun markUnblocked(vararg threadIds: Long)
+
+    fun deleteConversations(vararg threadIds: Long)
+
+}

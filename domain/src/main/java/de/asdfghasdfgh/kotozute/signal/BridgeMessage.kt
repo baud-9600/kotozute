@@ -1,0 +1,60 @@
+package de.asdfghasdfgh.kotozute.signal
+
+/*
+ * Moved here from the data module so the domain layer can name it.
+ *
+ * The package is unchanged, so every existing import still resolves. The name is now a
+ * misnomer -- messages reach this shape from the device's own Signal connection as well as
+ * from a bridge -- but renaming it touches the whole rail and belongs in its own change.
+ */
+
+data class BridgeMessage(
+    val id: String,
+    val threadKey: String,
+    val ts: Long,
+    val senderUuid: String,
+    val senderNumber: String,
+    val outgoing: Boolean,
+    val body: String,
+    val groupId: String,
+    val quoteTs: Long,
+    val read: Boolean,
+    val source: String,
+    /** The bridge's attachment array, kept as JSON; the app only reads it to draw a row. */
+    val attachmentsJson: String,
+    /** The text's styles -- bold, italic, spoiler and so on -- as [BodyStyles] stores them. */
+    val stylesJson: String = "",
+    /** A poll this message asks, as the data layer's `Polls.encode` writes it; empty for none. */
+    val pollJson: String = "",
+
+    /**
+     * When this copy must be gone, in ms, or 0 for never. The bridge sends it; the phone
+     * has to honour it independently, because the bridge deletes only its own row and the
+     * phone's copy is the one the user can still read.
+     */
+    val expiresAt: Long = 0,
+    val expiresInSeconds: Long = 0,
+    /** Signal intends this to be opened once. Its attachment is never stored. */
+    val viewOnce: Boolean = false,
+
+    /** Set only on a reaction row, which points at another message rather than being one. */
+    val reactionEmoji: String = "",
+    val reactionTarget: String = "",
+    val reactionRemove: Boolean = false,
+
+    /**
+     * The group's master key, when this arrived in a group over the device's own connection.
+     *
+     * Carried only so the group's name and members can be fetched: a group message names the
+     * group by a key, and everything readable about it lives on the server. Empty on the
+     * bridge rail, which resolved names on the other side.
+     */
+    val groupMasterKey: ByteArray? = null,
+
+    /** On an edit, the edit's own sent timestamp; the row keeps the original's. 0 otherwise. */
+    val revisionTs: Long = 0,
+
+    /** A line saying what changed, not a message. See [de.asdfghasdfgh.kotozute.model.SignalMessage.update]. */
+    val update: Boolean = false
+)
+

@@ -28,7 +28,7 @@
     android:paddingEnd="16dp"
     android:paddingBottom="8dp">
 
-    <com.wanderwildwood.kotozute.common.widget.AvatarView
+    <de.asdfghasdfgh.kotozute.common.widget.AvatarView
         android:id="@+id/avatar"
         android:visibility="gone"
         android:layout_width="40dp"
@@ -37,7 +37,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/name"
         style="@style/TextPrimary"
         android:layout_width="0dp"
@@ -53,7 +53,7 @@
         app:layout_constraintVertical_chainStyle="packed"
         tools:text="Moez Bhatti" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/address"
         style="@style/TextSecondary"
         android:layout_width="0dp"

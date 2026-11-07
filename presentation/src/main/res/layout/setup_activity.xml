@@ -15,7 +15,7 @@
         android:id="@+id/toolbar"
         style="@style/Toolbar">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/toolbarTitle"
             style="@style/ToolbarText"
             android:layout_width="match_parent"
@@ -28,7 +28,7 @@
 
     <!-- Turns pages rather than scrolling, landing on a row's edge, so a choice is never
          left cut through at the bottom of the screen at the larger text sizes. -->
-    <com.wanderwildwood.kotozute.common.widget.PagingScrollView
+    <de.asdfghasdfgh.kotozute.common.widget.PagingScrollView
         android:id="@+id/scroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -41,14 +41,14 @@
             android:orientation="vertical"
             android:padding="16dp">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/where"
                 style="@style/TextTertiary"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 tools:text="2 of 6" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/heading"
                 style="@style/TextPrimary"
                 android:layout_width="match_parent"
@@ -58,7 +58,7 @@
                 android:textStyle="bold"
                 tools:text="Signal" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/body"
                 style="@style/TextPrimary"
                 android:layout_width="match_parent"
@@ -67,7 +67,7 @@
                 tools:text="Signal can sit alongside your texts." />
 
             <!-- What the last choice did, when it takes a moment or says something back. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/status"
                 style="@style/TextPrimary"
                 android:layout_width="match_parent"
@@ -87,14 +87,14 @@
 
         </LinearLayout>
 
-    </com.wanderwildwood.kotozute.common.widget.PagingScrollView>
+    </de.asdfghasdfgh.kotozute.common.widget.PagingScrollView>
 
     <View
         android:layout_width="match_parent"
         android:layout_height="2dp"
         android:background="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/skip"
         style="@style/TextPrimary"
         android:layout_width="match_parent"

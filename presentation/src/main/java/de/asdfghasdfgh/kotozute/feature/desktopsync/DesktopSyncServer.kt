@@ -1,0 +1,2918 @@
+/*
+ * Desktop Sync relay: a small embedded HTTP + WebSocket server exposing this
+ * device's SMS conversations to a browser dashboard over a VPN (Tailscale,
+ * ZeroTier, ...). No relay server involved — the desktop client talks
+ * directly to this port on the phone's VPN address.
+ *
+ * Every request (HTTP and the WebSocket upgrade) must carry the token of a
+ * paired browser, since the VPN restricts *who* can reach this port but not
+ * what they can do once they're on its network. Each browser has its own
+ * token (PairedBrowsers), sent in a header or a cookie and never in a URL;
+ * the rules are in DesktopSyncSecurity.kt, where they are tested.
+ */
+package de.asdfghasdfgh.kotozute.feature.desktopsync
+
+import android.content.Context
+import android.content.res.AssetFileDescriptor
+import android.os.Build
+import android.telephony.PhoneNumberUtils
+import android.telephony.SubscriptionManager
+import android.webkit.MimeTypeMap
+import de.asdfghasdfgh.kotozute.interactor.SyncMessages
+import de.asdfghasdfgh.kotozute.repository.ScheduledMessageRepository
+import de.asdfghasdfgh.kotozute.interactor.UpdateScheduledMessageAlarms
+import de.asdfghasdfgh.kotozute.util.Preferences
+import kotlin.concurrent.thread
+import java.io.ByteArrayInputStream
+import java.io.InputStream
+import de.asdfghasdfgh.kotozute.compat.SubscriptionManagerCompat
+import de.asdfghasdfgh.kotozute.model.Attachment
+import de.asdfghasdfgh.kotozute.model.Conversation
+import de.asdfghasdfgh.kotozute.model.Message
+import de.asdfghasdfgh.kotozute.interactor.MarkRead
+import de.asdfghasdfgh.kotozute.interactor.SendNewMessage
+import de.asdfghasdfgh.kotozute.repository.ContactRepository
+import de.asdfghasdfgh.kotozute.repository.ConversationRepository
+import de.asdfghasdfgh.kotozute.repository.EmojiReactionRepository
+import de.asdfghasdfgh.kotozute.repository.MessageRepository
+import de.asdfghasdfgh.kotozute.feature.conversations.InboxItem
+import de.asdfghasdfgh.kotozute.feature.signal.SignalAttachment
+import de.asdfghasdfgh.kotozute.feature.signal.sayFailure
+import de.asdfghasdfgh.kotozute.model.SignalMessage
+import de.asdfghasdfgh.kotozute.model.SignalThread
+import de.asdfghasdfgh.kotozute.repository.SafetyNumberChanged
+import de.asdfghasdfgh.kotozute.repository.SignalRepository
+import io.realm.Realm
+import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoHTTPD.TempFile
+import fi.iki.elonen.NanoHTTPD.TempFileManager
+import fi.iki.elonen.NanoWSD
+import fi.iki.elonen.NanoWSD.WebSocketFrame
+import fi.iki.elonen.NanoWSD.WebSocketFrame.CloseCode
+import org.json.JSONArray
+import org.json.JSONObject
+import timber.log.Timber
+import java.io.IOException
+import java.util.Collections
+
+class DesktopSyncServer(
+    port: Int,
+    private val context: Context,
+    /** The paired browsers: each its own token, removable one by one from Settings. */
+    private val browsers: PairedBrowsers,
+    private val conversationRepository: ConversationRepository,
+    private val messageRepository: MessageRepository,
+    private val contactRepository: ContactRepository,
+    private val markRead: MarkRead,
+    private val sendNewMessage: SendNewMessage,
+    private val subscriptionManager: SubscriptionManagerCompat,
+    private val signalRepository: SignalRepository,
+    private val signalEnabled: () -> Boolean,
+    private val vpnOnly: () -> Boolean,
+    /** Which blocking backend to record against a block, read live like the two above. */
+    private val blockingManager: () -> Int,
+    /**
+     * The settings the browser can read and change. Passed whole rather than as another
+     * row of lambdas: the settings screen touches enough of them that a lambda each was
+     * going to be longer than the thing it avoided.
+     */
+    private val prefs: Preferences,
+    /** The phone's "Sync messages": re-read Android's own SMS store. */
+    private val syncMessages: SyncMessages,
+    /** Messages waiting to go out later, which the phone can list and the browser could not. */
+    private val scheduledMessageRepository: ScheduledMessageRepository,
+    /** Re-arms the alarms after the browser adds one, the same call the phone makes. */
+    private val updateScheduledMessageAlarms: UpdateScheduledMessageAlarms,
+) : NanoWSD(port) {
+
+    /**
+     * Whether this peer is allowed to talk to us at all, before the token is even looked at.
+     * With "VPN only" on, anything that doesn't come through a VPN is refused outright,
+     * so a device sharing the home Wi-Fi cannot reach the dashboard even holding the token.
+     * With it off, still only private addresses: never a global IPv6 or a public address.
+     */
+    private fun peerAllowed(ip: String?): Boolean {
+        val vpn = vpnOnly()
+        return de.asdfghasdfgh.kotozute.feature.desktopsync.peerAllowed(ip, vpn, if (vpn) DesktopSyncService.vpnSubnets(context) else emptyList())
+    }
+
+    /** Whether the socket is TLS, for the cookie's Secure flag. */
+    private val secure: Boolean get() = prefs.desktopSyncTls.get()
+
+    private companion object {
+        /**
+         * A pairing code is six digits. This caps a body arriving at the one route that
+         * answers before the token is checked, so it is deliberately tiny: anything larger
+         * is not a pairing attempt.
+         */
+        private const val MAX_PAIR_BODY_BYTES = 512
+
+        /** An action name is a single short word; nothing larger is one. */
+        private const val MAX_ACTION_BODY_BYTES = 256
+
+        /**
+         * `bytes=START-[END]` out of a Range header. Only the single-range form, which
+         * is the only one a video element ever asks for.
+         */
+        val RANGE = Regex("bytes=(\\d*)-(\\d*)")
+
+        /** How many of a thread's most recent messages to send to the browser. */
+        const val MESSAGE_PAGE_SIZE = 300
+
+        /** "No subscription named" -- what SmsManagerFactory reads as "use the default". */
+        const val NO_SUB_ID = -1
+
+        /** Ceiling on an explicit ?limit=, so one request can't try to serialize everything. */
+        const val MESSAGE_MAX_LIMIT = 5000
+
+        /** As many search hits as anyone reads before typing another letter. */
+        const val SEARCH_MAX_RESULTS = 200
+
+        /** How often we ping connected browsers. */
+        const val PING_INTERVAL_SECONDS = 30L
+
+        /**
+         * Drop a socket that hasn't answered a ping in this long (3 missed pings plus
+         * slack). Without this a half-open connection lives forever: if the peer vanishes
+         * without a FIN — browser killed, laptop slept, network switched — our ping still
+         * "succeeds" into the local send buffer for minutes, so nothing ever detects it,
+         * and NanoWSD's reader thread stays parked on a read that has no timeout.
+         */
+        const val DEAD_PEER_TIMEOUT_MS = 95_000L
+
+        /** Multipart field prefix the browser attaches files under: attachment0, attachment1... */
+        const val ATTACHMENT_FIELD = "attachment"
+
+        /** MuditaOS puts the monochrome Noto Emoji here, under the colour font's name. */
+        const val EMOJI_FONT_PATH = "/system/fonts/NotoColorEmoji.ttf"
+    }
+
+    private val openSockets = Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<PushSocket, Boolean>())
+
+    init {
+        // SO_REUSEADDR so an auto-restore right after a process kill can rebind the
+        // port immediately instead of failing while the old socket sits in TIME_WAIT.
+        // Return the socket UNBOUND: NanoHTTPD binds it itself in ServerRunnable, and
+        // binding here too fails the second bind with EADDRINUSE.
+        // ⚠ One factory, doing both jobs. NanoHTTPD's own `makeSecure` replaces the socket
+        // factory outright, which would quietly drop the SO_REUSEADDR below -- and that flag
+        // is why an auto-restore straight after a process kill can rebind instead of failing
+        // while the old socket sits in TIME_WAIT.
+        //
+        // ⚠ Still UNBOUND either way: NanoHTTPD binds it itself in ServerRunnable, and binding
+        // here too fails the second bind with EADDRINUSE.
+        val tls = if (prefs.desktopSyncTls.get()) DesktopSyncTls.serverSocketFactory(context) else null
+        if (prefs.desktopSyncTls.get() && tls == null) {
+            // Said out loud. Falling back to plain HTTP silently would leave somebody wondering
+            // why the browser still refuses the microphone on a phone they had switched TLS on
+            // for -- the setting saying one thing and the socket doing another.
+            Timber.w("desktop sync: TLS was asked for and could not be prepared; serving plainly")
+        }
+        setServerSocketFactory {
+            val socket = tls?.createServerSocket() ?: java.net.ServerSocket()
+            Timber.i(
+                "desktop sync: socket is %s (tls asked=%s, prepared=%s)",
+                socket.javaClass.simpleName, prefs.desktopSyncTls.get(), tls != null
+            )
+            socket.apply { reuseAddress = true }
+        }
+
+        // NanoHTTPD stages multipart uploads through temp files, and its default manager puts
+        // them in java.io.tmpdir -- which on Android is not reliably writable by an app. Point
+        // it at our own cache directory instead of finding out per device.
+        setTempFileManagerFactory { CacheDirTempFileManager(context) }
+
+        // A browser that is forgotten (or has gone unused for 30 days) is cut off at once,
+        // open page included.
+        browsers.onRemoved = { gone ->
+            openSockets.toList().filter { it.browserId in gone }.forEach { socket ->
+                runCatching { socket.close(CloseCode.PolicyViolation, "forgotten", false) }
+                openSockets.remove(socket)
+            }
+        }
+    }
+
+    /**
+     * Temp files for multipart uploads, kept inside the app's cache. Everything created for one
+     * request is deleted when that request ends, which is exactly why an upload has to be copied
+     * somewhere we own before it can be sent -- see stageUpload().
+     */
+    private class CacheDirTempFileManager(context: Context) : TempFileManager {
+
+        private val directory = java.io.File(context.cacheDir, "desktopsync-upload").apply { mkdirs() }
+        private val files = mutableListOf<TempFile>()
+
+        override fun createTempFile(filenameHint: String?): TempFile =
+            CacheDirTempFile(directory).also { files.add(it) }
+
+        override fun clear() {
+            files.forEach { file -> runCatching { file.delete() } }
+            files.clear()
+        }
+    }
+
+    private class CacheDirTempFile(directory: java.io.File) : TempFile {
+
+        private val file = java.io.File.createTempFile("upload-", "", directory)
+        private val stream = java.io.FileOutputStream(file)
+
+        override fun open(): java.io.OutputStream = stream
+
+        override fun delete() {
+            runCatching { stream.close() }
+            file.delete()
+        }
+
+        override fun getName(): String = file.absolutePath
+    }
+
+    private val keepAlive = java.util.concurrent.Executors.newSingleThreadScheduledExecutor().apply {
+        // Idle WebSockets can be dropped by the network in between messages; a periodic
+        // ping keeps them (and any NAT/Tailscale state) alive. The same pass doubles as
+        // dead-peer detection — see DEAD_PEER_TIMEOUT_MS for why a ping succeeding is not
+        // evidence that anyone is still listening.
+        scheduleWithFixedDelay({
+            val now = System.currentTimeMillis()
+            openSockets.toList().forEach { socket ->
+                if (!socket.isOpen) {
+                    openSockets.remove(socket)
+                    return@forEach
+                }
+                if (now - socket.lastPongAt > DEAD_PEER_TIMEOUT_MS) {
+                    Timber.i("Desktop Sync: dropping unresponsive WebSocket (no pong in " +
+                            "${(now - socket.lastPongAt) / 1000}s)")
+                    // Closing releases the parked reader thread and the socket with it.
+                    runCatching { socket.close(CloseCode.GoingAway, "no pong", false) }
+                    openSockets.remove(socket)
+                    return@forEach
+                }
+                runCatching { socket.ping(byteArrayOf()) }.onFailure { openSockets.remove(socket) }
+                // The page never sees a ping (the browser answers it underneath), so it is told
+                // in words too. A socket that has heard nothing for a while is how the page knows
+                // it is talking to nobody, rather than showing "live" over an old list.
+                runCatching { socket.send(ALIVE_PAYLOAD) }.onFailure { openSockets.remove(socket) }
+            }
+        }, PING_INTERVAL_SECONDS, PING_INTERVAL_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+    }
+
+    /** How many browsers are currently listening for push updates. */
+    fun socketCount(): Int = openSockets.size
+
+    /**
+     * Signal's catch-up, as the app's Signal screen runs it when it opens: whatever the server is
+     * holding is asked for, then the socket is held open. Nothing on the phone runs it while
+     * Desktop Sync is all that is running, so the page did not see Signal messages until the
+     * stream or the periodic worker drained the queue on its own.
+     */
+    private val signalCatchUp = SignalCatchUp {
+        signalRepository.syncNow()
+        signalRepository.startStream()
+    }
+
+    /** Starts Signal's catch-up, when Signal is on: a browser opened the page, or the service started. */
+    fun catchUpSignal() {
+        if (signalEnabled()) signalCatchUp.start()
+    }
+
+    /** Called whenever a conversation's data changes, to nudge connected browsers to refetch. */
+    fun notifyChanged() {
+        val payload = JSONObject().put("type", "changed").toString()
+        openSockets.toList().forEach { socket ->
+            // A send that throws means that browser has gone; dropping it from the set is
+            // the whole handling, and the page reconnects on its own if it is still open.
+            // A send that throws means that browser has gone; dropping it from the set is
+            // the whole handling, and the page reconnects on its own if it is still open.
+            runCatching { socket.send(payload) }.onFailure { openSockets.remove(socket) }
+        }
+    }
+
+    override fun stop() {
+        browsers.onRemoved = null
+        keepAlive.shutdownNow()
+        super.stop()
+    }
+
+    override fun openWebSocket(handshake: IHTTPSession): WebSocket {
+        return PushSocket(handshake)
+    }
+
+    private inner class PushSocket(handshake: IHTTPSession) : WebSocket(handshake) {
+
+        /** Last time this peer proved it's still there. Read from the keep-alive thread. */
+        @Volatile var lastPongAt = System.currentTimeMillis()
+
+        /** Which paired browser opened this, so forgetting it closes this too. */
+        @Volatile var browserId: String? = null
+
+        override fun onOpen() {
+            if (!peerAllowed(handshakeRequest.remoteIpAddress)) {
+                Timber.w("Desktop Sync: WebSocket rejected (peer not on a VPN)")
+                runCatching { close(CloseCode.PolicyViolation, "not on a VPN", false) }
+                return
+            }
+            // Only from this server's own page, and only with the cookie that page was given:
+            // never a token in the address.
+            val headers = handshakeRequest.headers
+            if (!sameOrigin(headers["origin"], headers["host"])) {
+                Timber.w("Desktop Sync: WebSocket rejected (not from the page)")
+                runCatching { close(CloseCode.PolicyViolation, "no", false) }
+                return
+            }
+            val id = browsers.check(presentedToken("GET", headers, handshakeRequest.parameters, listeningPort))
+            if (id == null) {
+                Timber.w("Desktop Sync: WebSocket rejected (bad/missing token)")
+                runCatching { close(CloseCode.PolicyViolation, "bad token", false) }
+                return
+            }
+            browserId = id
+            lastPongAt = System.currentTimeMillis()
+            openSockets.add(this)
+            Timber.i("Desktop Sync: WebSocket connected (${openSockets.size} total)")
+        }
+
+        override fun onClose(code: CloseCode?, reason: String?, initiatedByRemote: Boolean) {
+            openSockets.remove(this)
+        }
+
+        override fun onMessage(message: WebSocketFrame) {
+            // Clients don't send anything meaningful; this is a push-only channel.
+        }
+
+        override fun onPong(pong: WebSocketFrame) {
+            // The only proof we get that the far end is still alive.
+            lastPongAt = System.currentTimeMillis()
+        }
+
+        override fun onException(exception: IOException) {
+            // ⚠ A browser tab closing, a laptop sleeping, wifi changing hands: every one of
+            // those ends the socket from the far side, and this logged each as a warning with
+            // a full stack trace. Fourteen lines saying the thing that is supposed to happen
+            // happened, which is how a log stops being read.
+            //
+            // The far end going away is not this app's problem -- the client reconnects on its
+            // own, usually within seconds. Anything else still gets the trace, because an
+            // exception here that is *not* a disconnect is the interesting kind.
+            if (isOrdinaryDisconnect(exception)) {
+                Timber.i("Desktop Sync: WebSocket closed by the other end")
+            } else {
+                Timber.w(exception, "Desktop Sync WebSocket error")
+            }
+            openSockets.remove(this)
+        }
+    }
+
+    override fun serveHttp(session: IHTTPSession): Response = headed(route(session))
+
+    /**
+     * No caching unless a route asked for it (the emoji font, a picture), nothing sniffed, no
+     * referrer, no framing, on every answer. No CORS header is ever added.
+     */
+    private fun headed(response: Response): Response = response.apply {
+        SECURITY_HEADERS.forEach { (name, value) ->
+            if (getHeader(name) == null) addHeader(name, value)
+        }
+    }
+
+    private fun route(session: IHTTPSession): Response {
+        val uri = session.uri.trimEnd('/')
+
+        // Ahead of everything, including the two unauthenticated static assets: an
+        // off-tailnet caller should not be able to tell a running relay from a closed
+        // port by fetching index.html.
+        if (!peerAllowed(session.remoteIpAddress)) {
+            Timber.w("Desktop Sync: request refused (peer not on a VPN)")
+            // An empty 404, not a 403 explaining itself. The comment above says this check
+            // exists so an off-tailnet caller cannot tell a running relay from a closed
+            // port -- and then the refusal announced the relay, the bound port and the
+            // mode it was in, which is a better answer than the request deserved. A scan
+            // now learns only that there is nothing at this path.
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "")
+        }
+
+        // The static shell carries no message data, and the browser requests app.js
+        // from a plain <script src> with no way to attach the token — so serve those
+        // two unauthenticated. Everything touching actual messages is gated below.
+        when (uri) {
+            "", "/index.html" -> return servePage(session)
+            "/app.js" -> return serveAsset("app.js", "application/javascript")
+            "/emoji.json" -> return serveAsset("emoji.json", "application/json")
+            // Served unauthenticated for the same reason as app.js: a stylesheet's @font-face
+            // cannot carry an Authorization header. Neither this nor the list says anything
+            // about the messages -- one is a system font, the other is Unicode's own catalogue.
+            "/emoji-font" -> return serveEmojiFont()
+            // What makes the dashboard installable: a browser reading these will offer to
+            // put it in the menu with its own window and icon, which is a great deal
+            // friendlier than "bookmark this URL with a token in it".
+            "/manifest.webmanifest" -> return serveManifest()
+            "/icon.png" -> return serveAsset("icon.png", "image/png")
+        }
+
+        // Redeeming a pairing code is the one route that answers without a token -- it is
+        // how a browser gets one. Everything bounding it lives in DesktopSyncPairing: six
+        // digits, three minutes, five attempts, one use, and only after someone asked for
+        // it on the phone.
+        if (uri == "/api/pair-code" && session.method == Method.POST) {
+            return handlePairCode(session)
+        }
+        // How the page, on load, gets the cookie its pictures and socket need -- and how a
+        // browser still holding an earlier version's shared token trades it for its own.
+        if (uri == "/api/session" && session.method == Method.POST) {
+            return handleSession(session)
+        }
+
+        // A header or the cookie, never the address: see presentedToken.
+        val browser = browsers.check(presentedToken(session.method.name, session.headers, session.parameters, listeningPort))
+        if (browser == null) {
+            return jsonResponse(Response.Status.UNAUTHORIZED, JSONObject().put("error", "bad token"))
+                .apply { addHeader("Set-Cookie", clearedSessionCookie(listeningPort, secure)) }
+        }
+        // A change is only ever asked for by the page's own script, which says so. A page
+        // elsewhere cannot add this header without a preflight that is never answered.
+        if (session.method != Method.GET && session.headers[PAGE_HEADER] != "1") {
+            return jsonResponse(Response.Status.FORBIDDEN, JSONObject().put("error", "not from the page"))
+        }
+
+        // Realm only auto-refreshes on threads with a Looper. NanoHTTPD serves each
+        // connection on a plain worker thread, and a browser reusing one keep-alive
+        // connection lands on that same thread every time — so without an explicit
+        // refresh it keeps serving whatever snapshot the thread first opened, forever.
+        // (curl looked fine only because each new connection got a fresh thread.)
+        runCatching { Realm.getDefaultInstance().use { it.refresh() } }
+
+        val threadMessagesMatch = Regex("^/api/threads/(-?\\d+)/messages$").find(uri)
+        val threadSendMatch = Regex("^/api/threads/(-?\\d+)/send$").find(uri)
+        val threadReadMatch = Regex("^/api/threads/(-?\\d+)/read$").find(uri)
+        val threadActionMatch = Regex("^/api/threads/(-?\\d+)/action$").find(uri)
+        val threadCrossMatch = Regex("^/api/threads/(-?\\d+)/cross$").find(uri)
+        val threadInfoMatch = Regex("^/api/threads/(-?\\d+)/info$").find(uri)
+        val threadLinkMatch = Regex("^/api/threads/(-?\\d+)/link$").find(uri)
+        val messageDeleteMatch = Regex("^/api/messages/(\\d+)/delete$").find(uri)
+        val scheduledCancelMatch = Regex("^/api/scheduled/(\\d+)/cancel$").find(uri)
+        val partMatch = Regex("^/api/parts/(\\d+)$").find(uri)
+        // A strict shape on an id this serves: the value
+        // originates in a sender's attachment pointer, so nothing that could climb out of
+        // a directory is allowed to reach the fetch.
+        val signalPartMatch = Regex("^/api/signal/attachments/([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9]+)?)$").find(uri)
+
+        return when {
+            uri == "/api/threads" && session.method == Method.GET -> handleGetThreads(session)
+            uri == "/api/search" && session.method == Method.GET -> handleSearch(session)
+            uri == "/api/signal/state" && session.method == Method.GET -> handleSignalState()
+            uri == "/api/signal/account" && session.method == Method.GET -> handleSignalAccount()
+            uri == "/api/settings" && session.method == Method.GET -> handleGetSettings()
+            uri == "/api/settings" && session.method == Method.POST -> handleSetSetting(session)
+            uri == "/api/sync" && session.method == Method.POST -> handleSyncMessages()
+            uri == "/api/scheduled" && session.method == Method.GET -> handleScheduled()
+            uri == "/api/blocked" && session.method == Method.GET -> handleBlocked()
+            uri == "/api/signal/react" && session.method == Method.POST -> handleSignalReact(session)
+            uri == "/api/react" && session.method == Method.POST -> handleSmsReact(session)
+            uri == "/api/signal/accept-identity" && session.method == Method.POST ->
+                handleSignalAcceptIdentity(session)
+            uri == "/api/signal/withdraw" && session.method == Method.POST ->
+                handleSignalWithdraw(session)
+            threadMessagesMatch != null && session.method == Method.GET ->
+                handleGetMessages(threadMessagesMatch.groupValues[1].toLong(), session)
+            threadSendMatch != null && session.method == Method.POST ->
+                handleSend(session, threadSendMatch.groupValues[1].toLong())
+            uri == "/api/compose" && session.method == Method.POST -> handleCompose(session)
+            uri == "/desktop-entry" && session.method == Method.GET -> serveDesktopEntry()
+            uri == "/signal-link" && session.method == Method.GET -> serveSignalLink()
+            uri == "/api/contacts" && session.method == Method.GET -> handleContacts(session)
+            uri == "/api/sims" && session.method == Method.GET -> handleSims()
+            uri == "/api/thread-for" && session.method == Method.GET -> handleThreadFor(session)
+            messageDeleteMatch != null && session.method == Method.POST ->
+                handleDeleteMessage(messageDeleteMatch.groupValues[1].toLong())
+            scheduledCancelMatch != null && session.method == Method.POST ->
+                handleCancelScheduled(scheduledCancelMatch.groupValues[1].toLong())
+            partMatch != null && session.method == Method.GET ->
+                handlePart(partMatch.groupValues[1].toLong(), session)
+            signalPartMatch != null && session.method == Method.GET ->
+                handleSignalAttachment(signalPartMatch.groupValues[1], session)
+            threadReadMatch != null && session.method == Method.POST ->
+                handleMarkRead(threadReadMatch.groupValues[1].toLong())
+            threadActionMatch != null && session.method == Method.POST ->
+                handleThreadAction(threadActionMatch.groupValues[1].toLong(), session)
+            threadCrossMatch != null && session.method == Method.GET ->
+                handleThreadCross(threadCrossMatch.groupValues[1].toLong())
+            threadInfoMatch != null && session.method == Method.GET ->
+                handleThreadInfo(threadInfoMatch.groupValues[1].toLong())
+            threadLinkMatch != null && session.method == Method.POST ->
+                handleThreadLink(threadLinkMatch.groupValues[1].toLong(), session)
+            uri == "/api/mark-all-read" && session.method == Method.POST -> handleMarkAllRead()
+            else -> jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+        }
+    }
+
+    /**
+     * The phone's own emoji font, straight off the system partition.
+     *
+     * MuditaOS ships Google's monochrome **Noto Emoji** here under the colour font's filename,
+     * which is why emoji are clean line art on the Kompakt instead of dithered grey. Serving that
+     * same file to the browser means the picker shows what the person holding the phone will
+     * actually see, rather than whatever colour set the desktop happens to have.
+     *
+     * Read from the system rather than bundled: it is already on every Kompakt, so it costs the
+     * APK nothing. It is SIL OFL 1.1, so shipping it would be allowed -- this is only cheaper.
+     * If a future MuditaOS moves it, the browser falls back to its own emoji and nothing breaks.
+     */
+    private fun serveEmojiFont(): Response {
+        val font = java.io.File(EMOJI_FONT_PATH)
+        if (!font.canRead())
+            return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "no emoji font"))
+
+        val stream = runCatching { font.inputStream() }.getOrNull()
+            ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "font unreadable"))
+
+        return newFixedLengthResponse(Response.Status.OK, "font/ttf", stream, font.length()).apply {
+            // Two megabytes that never change: without this the browser refetches the whole font
+            // on every reload of the dashboard.
+            addHeader("Cache-Control", "public, max-age=604800")
+        }
+    }
+
+    /**
+     * Exchange a pairing code for the token. Deliberately says nothing about why a code was
+     * refused -- expired, wrong, already used and never issued all read the same, because
+     * telling them apart is only useful to someone guessing.
+     */
+    private fun handlePairCode(session: IHTTPSession): Response {
+        // Deliberately NOT readSubmission(). That calls parseBody(), which for a multipart
+        // request writes every part to a temp file before anything looks at it -- so the one
+        // route that answers without a token would let an unauthenticated caller on the LAN
+        // fill the phone's storage. A pairing code is six digits; nothing here needs a body
+        // parser, a file, or more than a handful of bytes.
+        // This is the one route that answers without a token, and its budget is five
+        // attempts before the code is dead. Any page in any browser -- pointed at the
+        // phone's LAN address, or at 127.0.0.1 on the phone itself, where the port is a
+        // fixed constant -- could otherwise spend all five in a hidden fetch, and the user
+        // would find a freshly shown code already refused. So the request has to prove it
+        // came from the Desktop Sync page: a custom header, which a cross-origin caller
+        // cannot set without a CORS preflight this server does not answer.
+        if (session.headers["x-kotozute-pairing"] != "1") {
+            Timber.w("Desktop Sync: a pairing attempt arrived without the page's own header")
+            return jsonResponse(
+                Response.Status.FORBIDDEN,
+                JSONObject().put("error", "open this page from the phone's Desktop Sync address")
+            )
+        }
+        val supplied = readSmallJsonField(session, "body", MAX_PAIR_BODY_BYTES)?.trim()
+        if (!DesktopSyncPairing.redeem(supplied)) {
+            Timber.w("Desktop Sync: a pairing code was refused")
+            return jsonResponse(
+                Response.Status.UNAUTHORIZED,
+                JSONObject().put("error", "that code is not valid — get a fresh one on the phone")
+            )
+        }
+        Timber.i("Desktop Sync: a pairing code was redeemed")
+        // This browser's own token; the phone keeps only a hash of it. Never logged.
+        val issued = browsers.issue(browserLabel(session.headers["user-agent"]))
+        return jsonResponse(Response.Status.OK, JSONObject().put("token", issued))
+            .apply { addHeader("Set-Cookie", sessionCookie(listeningPort, issued, secure)) }
+    }
+
+    /**
+     * The page asks this once on load, with its token in the header. The answer sets the
+     * cookie (which the page's own script cannot read) that lets pictures, voice notes, videos,
+     * downloads and the WebSocket prove themselves without a token in their address.
+     *
+     * A browser that still holds the one token every browser shared before this version gets
+     * a token of its own in exchange, and the page keeps that from then on.
+     */
+    private fun handleSession(session: IHTTPSession): Response {
+        if (session.headers[PAGE_HEADER] != "1") {
+            return jsonResponse(Response.Status.FORBIDDEN, JSONObject().put("error", "not from the page"))
+        }
+        val presented = bearerToken(session.headers["authorization"])
+        if (browsers.check(presented) != null) {
+            catchUpSignal()
+            return jsonResponse(Response.Status.OK, JSONObject())
+                .apply { addHeader("Set-Cookie", sessionCookie(listeningPort, presented!!, secure)) }
+        }
+        val exchanged = browsers.exchangeLegacy(presented, browserLabel(session.headers["user-agent"]))
+        if (exchanged != null) {
+            Timber.i("Desktop Sync: a browser traded the old shared token for its own")
+            catchUpSignal()
+            return jsonResponse(Response.Status.OK, JSONObject().put("token", exchanged))
+                .apply { addHeader("Set-Cookie", sessionCookie(listeningPort, exchanged, secure)) }
+        }
+        return jsonResponse(Response.Status.UNAUTHORIZED, JSONObject().put("error", "bad token"))
+            .apply { addHeader("Set-Cookie", clearedSessionCookie(listeningPort, secure)) }
+    }
+
+    /**
+     * Read one field out of a small JSON body, reading at most [limit] bytes and never
+     * touching disk. For the routes that must answer before the token is checked.
+     */
+    private fun readSmallJsonField(session: IHTTPSession, field: String, limit: Int): String? {
+        val declared = session.headers["content-length"]?.toIntOrNull() ?: 0
+        if (declared > limit) {
+            Timber.w("Desktop Sync: refused a %d-byte body on an unauthenticated route", declared)
+            return null
+        }
+        val buffer = ByteArray(limit)
+        var read = 0
+        return runCatching {
+            val input = session.inputStream
+            while (read < limit) {
+                // Stop at what was declared; NanoHTTPD's stream does not end at the body.
+                if (declared in 1..read) break
+                val n = input.read(buffer, read, limit - read)
+                if (n <= 0) break
+                read += n
+            }
+            val text = String(buffer, 0, read, Charsets.UTF_8)
+            JSONObject(text).optString(field).takeIf { it.isNotEmpty() }
+        }.getOrNull()
+    }
+
+    /**
+     * The whole small JSON body, for the routes that need more than one field out of it.
+     *
+     * There is exactly one read of the request stream available, so asking
+     * readSmallJsonField twice does not give two fields -- the first call drains the body
+     * and the second finds nothing and then blocks waiting for bytes that will not come.
+     * That is not a hypothetical: every settings write landed as false and the request
+     * after it timed out.
+     */
+    private fun readSmallJson(session: IHTTPSession, limit: Int): JSONObject? {
+        val declared = session.headers["content-length"]?.toIntOrNull() ?: 0
+        if (declared > limit) {
+            Timber.w("Desktop Sync: refused a %d-byte body", declared)
+            return null
+        }
+        val buffer = ByteArray(limit)
+        var read = 0
+        return runCatching {
+            val input = session.inputStream
+            while (read < limit) {
+                if (declared in 1..read) break
+                val n = input.read(buffer, read, limit - read)
+                if (n <= 0) break
+                read += n
+            }
+            JSONObject(String(buffer, 0, read, Charsets.UTF_8))
+        }.getOrNull()
+    }
+
+    /**
+     * The web app manifest. [start_url] is the bare page: an installed window shares the
+     * browser's storage, so it opens already paired, and no token is ever put in an address.
+     */
+    private fun serveManifest(): Response {
+        val start = "/"
+        val manifest = JSONObject().apply {
+            put("name", "Messaging")
+            put("short_name", "Messaging")
+            put("description", "Text from your computer, through the phone.")
+            put("start_url", start)
+            put("scope", "/")
+            put("display", "standalone")
+            put("background_color", "#ffffff")
+            put("theme_color", "#ffffff")
+            put("icons", JSONArray().put(JSONObject().apply {
+                put("src", "/icon.png")
+                put("sizes", "512x512")
+                put("type", "image/png")
+                put("purpose", "any maskable")
+            }))
+        }
+        return jsonResponse(Response.Status.OK, manifest).apply {
+            mimeType = "application/manifest+json"
+        }
+    }
+
+    /**
+     * A Linux desktop entry with this phone's address in it (and no token: the browser it
+     * opens is already paired, and a token in a file is a token anyone can copy), so the
+     * dashboard can be started from an applications menu like anything else. The browser
+     * saves it; where it has to go afterwards is in the page's own instructions, because no
+     * web page is allowed to write to ~/.local/share.
+     */
+    private fun serveDesktopEntry(): Response {
+        val address = DesktopSyncService.findVpnAddress(context)
+            ?: DesktopSyncService.findLanAddress(context)
+            ?: "127.0.0.1"
+        // The scheme has to follow the socket, or the link hands somebody a page that will
+        // not load at all.
+        val url = DesktopSyncService.linkUrl(prefs.desktopSyncTls.get(), address, listeningPort)
+        val entry = desktopEntryFor(url)
+        return newFixedLengthResponse(Response.Status.OK, "application/x-desktop", entry).apply {
+            addHeader("Content-Disposition", "attachment; filename=\"messaging.desktop\"")
+        }
+    }
+
+    /**
+     * The Signal link code, as something a phone's camera can read off a monitor.
+     *
+     * The one route on this server that exists for the phone rather than for the computer:
+     * see [SignalLinkOffer] for why a phone that already runs Signal cannot otherwise be
+     * linked at all. The page is deliberately nothing but the code -- a monitor showing a
+     * code to a camera wants contrast and size, not a layout.
+     *
+     * Behind the token like everything else below the gate. It answers with the same page
+     * whether or not a code is live, because an unauthenticated scanner never reaches here
+     * and an authenticated reader is owed a plain answer either way.
+     */
+    private fun serveSignalLink(): Response {
+        val code = SignalLinkOffer.current
+        val body = if (code == null) {
+            "<p class=\"none\">Nothing is waiting to be linked. Open Link this phone, " +
+                "in Settings under Signal, and this page will show its code.</p>"
+        } else {
+            "<img alt=\"\" src=\"data:image/png;base64," + qrPngBase64(code) + "\">" +
+                "<p>Point this phone's Signal at the screen: Settings \u2192 Linked devices " +
+                "\u2192 Link new device.</p>"
+        }
+        // No refresh, no script, no styling beyond what a camera needs. The code lives about
+        // ninety seconds, and a page that reloaded itself would go blank in front of someone
+        // holding a phone up to it.
+        val nonce = newNonce()
+        val html = "<!doctype html><html><head><meta charset=\"utf-8\">" +
+            "<title>Link this phone to Signal</title><style nonce=\"" + nonce + "\">" +
+            "body{background:#fff;color:#000;font:16px/1.4 sans-serif;text-align:center;margin:2rem}" +
+            "img{width:min(80vw,80vh);height:auto;image-rendering:pixelated}" +
+            ".none{max-width:32rem;margin:4rem auto}" +
+            "</style></head><body>" + body + "</body></html>"
+        return newFixedLengthResponse(Response.Status.OK, "text/html", html)
+            .apply { addHeader("Content-Security-Policy", linkPageCsp(nonce)) }
+    }
+
+    private val random = java.security.SecureRandom()
+
+    /** A fresh value for each page served, so a style block the page did not bring cannot run. */
+    private fun newNonce(): String = android.util.Base64.encodeToString(
+        ByteArray(16).also(random::nextBytes),
+        android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING
+    )
+
+    /**
+     * The dashboard, with this answer's nonce on its one style block and the
+     * Content-Security-Policy that names it: the page's own script file and nothing inline.
+     */
+    private fun servePage(session: IHTTPSession): Response {
+        val html = runCatching {
+            context.assets.open("desktopsync/index.html").use { String(it.readBytes(), Charsets.UTF_8) }
+        }.getOrNull() ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "asset missing"))
+        val nonce = newNonce()
+        return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html.replace("__NONCE__", nonce))
+            .apply { addHeader("Content-Security-Policy", pageCsp(nonce, session.headers["host"])) }
+    }
+
+    /**
+     * A QR of [text] as base64 PNG.
+     *
+     * Error correction L and a one-module quiet zone, as on the phone's own screen: the
+     * modules stay as large as they can, which is what a camera reading a backlit monitor
+     * from arm's length needs more than redundancy.
+     */
+    private fun qrPngBase64(text: String): String {
+        val size = 512
+        val matrix = com.google.zxing.qrcode.QRCodeWriter().encode(
+            text,
+            com.google.zxing.BarcodeFormat.QR_CODE,
+            size,
+            size,
+            mapOf(
+                com.google.zxing.EncodeHintType.ERROR_CORRECTION to
+                    com.google.zxing.qrcode.decoder.ErrorCorrectionLevel.L,
+                com.google.zxing.EncodeHintType.MARGIN to 1
+            )
+        )
+        val pixels = IntArray(size * size)
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                pixels[y * size + x] = if (matrix.get(x, y)) android.graphics.Color.BLACK
+                    else android.graphics.Color.WHITE
+            }
+        }
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            pixels, size, size, android.graphics.Bitmap.Config.RGB_565
+        )
+        val out = java.io.ByteArrayOutputStream()
+        bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+        return android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    }
+
+    private fun serveAsset(name: String, mimeType: String): Response {
+        val stream = runCatching { context.assets.open("desktopsync/$name") }.getOrNull()
+            ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "asset missing"))
+        return newChunkedResponse(Response.Status.OK, mimeType, stream)
+    }
+
+
+    /**
+     * Whether Signal is set up on this phone, so the browser knows whether to offer to do it.
+     */
+    private fun handleSignalState(): Response = jsonResponse(
+        Response.Status.OK,
+        JSONObject()
+            .put("configured", signalRepository.isConfigured())
+            .put("enabled", signalEnabled())
+    )
+
+    /**
+     * The Signal account this phone is on: its number, and the devices on it.
+     *
+     * The browser had a status dot and nothing else, so there was no way to answer "which
+     * number is this" or "what else is signed in" without picking the phone up. The device
+     * list is the part worth having: a device on the account that should not be there is
+     * exactly the sort of thing nobody notices until they go looking.
+     *
+     * Read-only. Removing a device is destructive, irreversible from here, and the kind of
+     * thing that should be done where the person can see the account they are doing it to.
+     *
+     * Signal is asked live, so this reports what is true now rather than what was true
+     * when something was last cached -- and it says plainly when the account will not
+     * answer, rather than showing an empty account that looks like an account with nothing
+     * on it.
+     */
+    private fun handleSignalAccount(): Response {
+        // Enabled, not merely configured. Turning Signal off should stop the browser
+        // reaching Signal, and this route was answering with the account -- number and
+        // devices -- while every other Signal route correctly refused. An off switch that
+        // some routes honour and others do not is not an off switch.
+        if (!signalEnabled() || !signalRepository.isConfigured()) {
+            return jsonResponse(Response.Status.OK, JSONObject().put("error", "Signal is off"))
+        }
+        val account = runCatching { signalRepository.account() }.getOrElse { failure ->
+            Timber.w(failure, "Desktop Sync: account lookup")
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject().put("error", failure.message ?: "the phone could not answer that")
+            )
+        }
+        val devices = JSONArray()
+        account.devices.sortedBy { it.id }.forEach { d ->
+            devices.put(JSONObject().apply {
+                put("id", d.id)
+                put("name", d.name.ifBlank { "device " + d.id })
+                put("created", d.created)
+                put("primary", d.isPrimary)
+            })
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().apply {
+            put("number", account.number)
+            put("devices", devices)
+        })
+    }
+
+    /**
+     * Put an emoji on a Signal message, or take this account's own back off.
+     *
+     * The phone does the work; this only carries the request. SMS has its own route,
+     * [handleSmsReact], because an SMS reaction is a different act: a whole separate text
+     * message reading "Liked “…”", which the other phone turns back into a reaction.
+     */
+    private fun handleSignalReact(session: IHTTPSession): Response {
+        if (!signalEnabled() || !signalRepository.isConfigured()) {
+            return jsonResponse(
+                Response.Status.NOT_FOUND, JSONObject().put("error", "Signal is not set up")
+            )
+        }
+        val body = readSmallJson(session, 4096)
+            ?: return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "bad request body"))
+        val id = body.optString("id")
+        val emoji = body.optString("emoji")
+        val remove = body.optBoolean("remove", false)
+        if (id.isBlank() || emoji.isBlank()) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST, JSONObject().put("error", "need a message and an emoji")
+            )
+        }
+        return runCatching {
+            signalRepository.react(id, emoji, remove)
+            jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+        }.getOrElse { failure ->
+            Timber.w(failure, "Desktop Sync: reaction")
+            jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", "the phone could not send that reaction")
+            )
+        }
+    }
+
+
+    /**
+     * React to an SMS/MMS message, or take this phone's reaction back off.
+     *
+     * Sends a text of its own ("Loved “…”") into the message's conversation, the way an
+     * iPhone does; see [MessageRepository.sendEmojiReaction].
+     */
+    private fun handleSmsReact(session: IHTTPSession): Response {
+        val body = readSmallJson(session, 4096)
+            ?: return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "bad request body"))
+        val id = body.optLong("id", 0L)
+        val emoji = body.optString("emoji")
+        val remove = body.optBoolean("remove", false)
+        if (id == 0L || emoji.isBlank()) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST, JSONObject().put("error", "need a message and an emoji")
+            )
+        }
+        val sent = runCatching { messageRepository.sendEmojiReaction(id, emoji, remove) }
+            .onFailure { Timber.w(it, "Desktop Sync: SMS reaction") }
+            .getOrDefault(false)
+        return if (sent) {
+            jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+        } else {
+            jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", "the phone could not send that reaction")
+            )
+        }
+    }
+
+    /**
+     * One search at a time. Each one walks every conversation and copies the matching
+     * messages out of Realm, and the browser fires a fresh request per keystroke past its
+     * debounce. The browser now cancels the request it has typed past, but a cancelled
+     * request is only cancelled at the socket -- the scan it started keeps running. This
+     * lock is what actually bounds the work: a second search waits for the first rather
+     * than stacking another full scan onto the same small CPU.
+     */
+    private val searchLock = Any()
+
+    /**
+     * Search both rails by message body, not just by name.
+     *
+     * The browser could only filter the conversation list it had already fetched, matching
+     * a title or the one snippet a row carries -- so searching for something said inside a
+     * conversation found nothing, on either rail. This is the same search the phone does,
+     * through the same repositories, so the two give the same answers.
+     */
+    private fun handleSearch(session: IHTTPSession): Response = synchronized(searchLock) {
+        val query = session.parameters["q"]?.firstOrNull()?.trim().orEmpty()
+        // Two characters, as the phone's search does: one letter matches most of an inbox
+        // and costs a full scan to say so.
+        if (query.length < 2) {
+            return jsonResponse(Response.Status.OK, JSONObject().put("results", JSONArray()))
+        }
+
+        val rows = mutableListOf<Pair<Long, JSONObject>>()
+        val hits = if (signalEnabled()) signalRepository.searchThreads(query) else emptyList()
+        // Every Signal thread, not only the matching ones. A text that matches belongs to a
+        // conversation the reader opens as one thing, and offering the text half on its own
+        // opens a screen the list does not show, holding half of what was said.
+        val allSignal =
+            if (!signalEnabled()) emptyList()
+            else signalRepository.getThreadsSnapshot(archived = false) +
+                signalRepository.getThreadsSnapshot(archived = true)
+        val threadForConversation = buildMap {
+            allSignal.forEach { t -> joinedConversationId(t)?.let { put(it, t) } }
+        }
+        // The text half of each joined row, as the inbox list passes it. Without it a result
+        // carried only its Signal half: dated at the last Signal message, so somebody being
+        // texted today sank under people from last month, and opened on the Signal side.
+        fun joinedFor(t: SignalThread) = threadForConversation.entries
+            .firstOrNull { it.value.threadKey == t.threadKey }?.key
+            ?.let { id -> runCatching { conversationRepository.getConversation(id) }.getOrNull() }
+            ?.takeIf { it.isValid }
+        // Matches found on the text side, counted against the conversation they belong to.
+        val textMatches = mutableMapOf<String, Pair<Int, String>>()
+
+        conversationRepository.searchConversations(query).forEach { result ->
+            val joinedThread = threadForConversation[result.conversation.id]
+            if (joinedThread == null) {
+                rows += result.conversation.date to conversationJson(result.conversation).apply {
+                    put("matches", result.messages)
+                }
+            } else {
+                // Folded into the one row for this person. Both halves matched or only one
+                // did; either way the reader is offered the conversation, once.
+                val key = joinedThread.threadKey
+                val had = textMatches[key]
+                textMatches[key] = (had?.first ?: 0) + result.messages to
+                    (had?.second ?: result.conversation.snippet.orEmpty())
+            }
+        }
+
+        val matchedKeys = hits.mapTo(mutableSetOf()) { it.thread.threadKey }
+        hits.forEach { hit ->
+            val extra = textMatches[hit.thread.threadKey]
+            val row = signalThreadJson(hit.thread, joinedFor(hit.thread)).apply {
+                put("matches", hit.messages + (extra?.first ?: 0))
+                // The matching line, so a hit inside a long conversation says what it
+                // found rather than only that it found something.
+                if (hit.snippet.isNotBlank()) put("snippet", hit.snippet)
+            }
+            // Sorted on the date the row shows, as the inbox list is.
+            rows += row.optLong("date", hit.thread.lastTs) to row
+        }
+        // A person whose text half matched and whose Signal half did not is still a result:
+        // the conversation contains what was searched for.
+        textMatches.forEach { (key, found) ->
+            if (key in matchedKeys) return@forEach
+            val thread = allSignal.firstOrNull { it.threadKey == key } ?: return@forEach
+            val row = signalThreadJson(thread, joinedFor(thread)).apply {
+                put("matches", found.first)
+                if (found.second.isNotBlank()) put("snippet", found.second)
+            }
+            rows += row.optLong("date", thread.lastTs) to row
+        }
+
+        val array = JSONArray()
+        // Name matches first, then by how much matched, then newest -- the order the phone
+        // uses, so the same search does not read differently in the two places. Capped: a
+        // two-letter query can match most of an inbox, and nobody scrolls a thousand rows
+        // looking for one -- they type another letter.
+        //
+        // Except that anyone whose *name* is what was searched comes first, newest first,
+        // whether or not their messages also matched. Counting matches put a person below
+        // group chats that mention them more often, however recently they were texted --
+        // and searching a name is looking for that person.
+        val (named, rest) = rows.partition {
+            it.second.optString("title").contains(query, ignoreCase = true)
+        }
+        (named.sortedByDescending { it.first } +
+            rest.sortedWith(
+                compareBy<Pair<Long, JSONObject>> { it.second.optInt("matches") > 0 }
+                    .thenByDescending { it.second.optInt("matches") }
+                    .thenByDescending { it.first }
+            )
+        ).take(SEARCH_MAX_RESULTS).forEach { array.put(it.second) }
+        return jsonResponse(Response.Status.OK, JSONObject().put("results", array))
+    }
+
+    // ---- the Signal rail -----------------------------------------------------
+
+    /** A Signal thread's own name, for the one-to-one case where there is no sender map. */
+    private fun signalThreadTitle(threadKey: String): String? = runCatching {
+        (signalRepository.getThreadsSnapshot(archived = false) +
+            signalRepository.getThreadsSnapshot(archived = true))
+            .firstOrNull { it.threadKey == threadKey }
+            ?.title?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    /**
+     * The Signal thread an id refers to, or null if the id is a telephony one.
+     *
+     * Ids are derived from the thread key rather than stored, so this walks the threads
+     * and matches. There are dozens, not thousands, and the alternative is a second
+     * identifier to keep in step with the one the inbox already uses.
+     */
+    private fun signalThreadFor(id: Long): SignalThread? {
+        if (!InboxItem.isSignalId(id) || !signalEnabled()) return null
+        // Both shelves. Looking only at the inbox meant archiving a thread turned it, in the
+        // browser, into a conversation that opened blank and could not be replied to -- the
+        // id still resolved to a row the list had, and nothing here could find it.
+        return (signalRepository.getThreadsSnapshot(archived = false) +
+            signalRepository.getThreadsSnapshot(archived = true))
+            .firstOrNull { InboxItem.signalStableId(it.threadKey) == id }
+    }
+
+    /** What a Signal row can be asked to do. Signal has no delete that means anything here. */
+    private val SIGNAL_THREAD_ACTIONS = setOf(
+        "archive", "unarchive", "pin", "unpin", "mute", "unmute", "unread", "block", "unblock"
+    )
+
+    /**
+     * The text conversation a Signal thread stands for, when the two are one person.
+     *
+     * The browser has to agree with the phone about this. It showed two conversations where
+     * the phone shows one, so the same person appeared twice, each row holding half of what
+     * they said -- and replying in one of them put the answer somewhere the other could not
+     * see. The joining rule is the phone's: a shared number, or a link made by hand.
+     */
+    private fun joinedConversationId(thread: SignalThread): Long? =
+        runCatching { signalRepository.linkedConversationId(thread.threadKey) }.getOrNull()
+            ?: numberFor(thread)?.let { number ->
+                runCatching { conversationRepository.getConversation(listOf(number))?.id }
+                    .getOrNull()
+            }
+
+    /**
+     * The number to match a Signal thread on.
+     *
+     * Note to Self carries none: its counterpart is the account itself. The text
+     * conversation somebody keeps with their own number is the same conversation with
+     * themselves, and the account's own number is the only thing that links them.
+     */
+    private fun numberFor(thread: SignalThread): String? {
+        thread.counterpartNumber.takeIf { it.isNotBlank() }?.let { return it }
+        if (thread.kind != "direct") return null
+        val self = runCatching { signalRepository.selfNumber() }.getOrDefault("")
+        val selfAci = runCatching { signalRepository.account().selfUuid }.getOrDefault("")
+        return if (self.isNotBlank() && selfAci.isNotBlank() && thread.counterpartUuid == selfAci) {
+            self
+        } else {
+            null
+        }
+    }
+
+    private fun joinedConversationIds(threads: List<SignalThread>): Set<Long> =
+        if (!signalEnabled()) emptySet()
+        else threads.mapNotNullTo(mutableSetOf()) { joinedConversationId(it) }
+
+    /**
+     * [joined] is the text conversation this row also stands for, where there is one.
+     *
+     * The date, the snippet and the unread mark come from whichever half spoke last. Reading
+     * them off the Signal half alone sank a conversation to where its last *Signal* message
+     * was: somebody who used to be on Signal and has been texting lately sat days down the
+     * list, under a snippet from months ago, while their newest message was yesterday's.
+     */
+    private fun signalThreadJson(
+        t: SignalThread,
+        joined: de.asdfghasdfgh.kotozute.model.Conversation? = null
+    ) = JSONObject().apply {
+        val textIsNewer = joined != null && joined.isValid && joined.date > t.lastTs
+        put("id", InboxItem.signalStableId(t.threadKey))
+        // Which rail to open: the one the row is reporting. Everything a row is *acted* on
+        // by still keys off the id above, so the pair is archived, blocked and muted as one
+        // person however this happens to point.
+        if (textIsNewer && joined != null) put("openId", joined.id)
+        put("title", t.title.ifBlank { t.counterpartNumber.ifBlank { t.threadKey.substringAfter(":") } })
+        put("snippet", when {
+            textIsNewer -> joined!!.snippet.orEmpty()
+            t.snippetOutgoing && t.snippet.isNotBlank() -> "You: " + t.snippet
+            else -> t.snippet
+        })
+        put("date", if (textIsNewer) joined!!.date else t.lastTs)
+        put("unread", t.unread > 0 || (joined?.isValid == true && joined.unread))
+        put("rail", "signal")
+        put("pinned", t.pinned)
+        put("muted", t.muted)
+        put("archived", t.archived)
+        // No blocked flag: setBlocked acts on the Signal account itself and the state
+        // lives there, not in this row, so there is nothing local to report. The browser
+        // offers Block and not a toggle, rather than guessing which way round it is.
+    }
+
+    /**
+     * [senders] maps a sender UUID to a display name, and is empty for a one-to-one thread
+     * -- the same rule the phone's own thread screen uses. Without it every incoming bubble
+     * in a Signal group read as one voice in the browser, while the phone showed the same
+     * conversation attributed and the SMS side already sent a name.
+     */
+    private fun signalMessageJson(
+        m: SignalMessage,
+        senders: Map<String, String> = emptyMap(),
+        reactorName: (String) -> String = { it }
+    ) = JSONObject().apply {
+        // The desktop list keys on this; Signal's own id is a string, so derive a stable
+        // number from it the same way thread ids are derived.
+        put("id", InboxItem.signalStableId(m.id))
+        // Signal's own id as well. The number above is a hash and cannot be turned back
+        // into the row it came from, so anything the browser asks the phone to do TO a
+        // particular message -- reacting to it -- needs the real one.
+        put("signalId", m.id)
+        put("body", m.body)
+        // The text's styles, which the page draws as the phone does -- spoilers included,
+        // hidden until clicked. `[[start, length, code], ...]`; see BodyStyles.
+        if (m.styles.isNotEmpty()) runCatching { put("styles", org.json.JSONArray(m.styles)) }
+        put("date", m.date)
+        put("isMe", m.outgoing)
+        put("read", m.read)
+        put("rail", "signal")
+        // The same field the text rail sends, which the browser already draws. A Signal
+        // message is written down before it goes now, so it has a sending and a not-sent too.
+        if (m.outgoing) {
+            when (m.sendState) {
+                SignalMessage.SEND_SENDING -> put("status", "sending")
+                SignalMessage.SEND_FAILED -> put("status", "failed")
+            }
+        }
+        // ⚠ Answered here rather than worked out in the browser. Taking a message back is
+        // ours-only and inside a window, and that rule is `SignalRepository.canWithdraw` --
+        // Signal's own `isValidRemoteDeleteSend` reduced to what this app has. A second copy
+        // of it in JavaScript would drift, and the drift shows up as a menu offering
+        // something the phone then refuses, which reads as the browser being broken.
+        //
+        // ⚠ Computed at serialisation time, so it is as fresh as the message list. The window
+        // closes while a page is open; a browser that kept a stale true would offer it and be
+        // refused, which is why the phone is also the one that enforces it.
+        put(
+            "canWithdraw",
+            // Nobody has a message that did not go, so there is nothing to take back.
+            // A call line is history, not a message anybody has.
+            !m.id.startsWith("call:") && !m.id.startsWith("groupcall:") &&
+            m.sendState == SignalMessage.SEND_SENT && SignalRepository.canWithdraw(m.outgoing, m.date)
+        )
+        // Real attachments, not a note saying one exists. The browser was told only
+        // "attachment" for every Signal picture, video and voice note, so a photo someone
+        // sent was unviewable there for as long as the thread lived -- while the phone,
+        // reading the same rows, drew it.
+        signalAttachmentsJson(m)?.let { put("attachments", it) }
+        // A view-once message has no body and no attachment on purpose: the picture is
+        // gone, which is the whole promise. Unflagged, the browser drew an empty bubble --
+        // the same hole the row is kept to avoid, and the same one the phone had
+        // until this morning. A disappearing message says when it goes, so the reader can
+        // tell a thread that empties itself from one that lost something.
+        // Reactions others have put on this message, counted per emoji. Counted here rather
+        // than in the browser so the phone and the page agree on the reading without two
+        // implementations of the same tally.
+        if (m.reactions.isNotBlank()) {
+            val counts = LinkedHashMap<String, Int>()
+            // Who, per emoji, for the page to show on hover.
+            val who = HashMap<String, MutableList<String>>()
+            var mine = ""
+            runCatching { JSONArray(m.reactions) }.getOrNull()?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val entry = arr.optJSONObject(i) ?: continue
+                    val emoji = entry.optString("emoji")
+                    if (emoji.isEmpty()) continue
+                    counts[emoji] = (counts[emoji] ?: 0) + 1
+                    who.getOrPut(emoji) { mutableListOf() } += reactorName(entry.optString("who"))
+                    // Marked so the page can show which one is this account's, and offer to
+                    // take that one back rather than guessing at somebody else's.
+                    if (entry.optString("who") == "me") mine = emoji
+                }
+            }
+            if (counts.isNotEmpty()) {
+                put("reactions", JSONArray().apply {
+                    counts.entries.sortedByDescending { it.value }.forEach { (emoji, n) ->
+                        put(JSONObject().put("emoji", emoji).put("count", n).apply {
+                            if (emoji == mine) put("mine", true)
+                            put("names", JSONArray(who[emoji].orEmpty()))
+                        })
+                    }
+                })
+            }
+        }
+        // What this message replies to, resolved here rather than in the browser. The page
+        // holds one screen of messages and the original is often older than that; the phone
+        // has the whole thread and can answer in one lookup.
+        if (m.quoteTs != 0L) {
+            val original = runCatching {
+                signalRepository.getMessageAt(m.threadKey, m.quoteTs)
+            }.getOrNull()
+            put("quote", JSONObject().apply {
+                if (original == null) {
+                    put("missing", true)
+                } else {
+                    // senders is only filled for groups; in a one-to-one thread the name is
+                    // the thread's own, not a slice of a uuid.
+                    put("from", if (original.outgoing) "You" else {
+                        senders[original.senderUuid]
+                            ?: signalThreadTitle(original.threadKey)
+                            ?: original.senderNumber.ifBlank { original.senderUuid.take(8) }
+                    })
+                    // A quoted spoiler stays hidden: the quote line has no way to reveal it.
+                    put(
+                        "body",
+                        de.asdfghasdfgh.kotozute.signalstore.BodyStyles.withSpoilersHidden(
+                            original.body,
+                            de.asdfghasdfgh.kotozute.signalstore.BodyStyles.decode(original.styles)
+                        ).replace("\n", " ").trim()
+                    )
+                }
+            })
+        }
+        if (m.viewOnce) put("viewOnce", true)
+        if (m.expiresAt > 0) {
+            put("expiresAt", m.expiresAt)
+            put("expiresInSeconds", m.expiresInSeconds)
+        }
+        if (senders.isNotEmpty() && !m.outgoing) {
+            val name = senders[m.senderUuid]
+                ?: m.senderNumber.ifBlank { m.senderUuid.take(8) }
+            if (name.isNotBlank()) put("from", name)
+        }
+    }
+
+    /**
+     * A Signal message's attachments, in the shape the browser already draws for MMS.
+     *
+     * The stored value is an array kept as text. Two things differ from the
+     * MMS side. The id is a string, not a row number, so these are fetched on their own
+     * route. And an attachment we sent ourselves has no id at all -- Signal assigns one on
+     * upload and never reports it back -- so there is nothing to fetch and the entry is
+     * described but not linked, the same compromise the phone makes.
+     */
+    private fun signalAttachmentsJson(m: SignalMessage): JSONArray? {
+        if (m.attachments.isBlank() || m.attachments == "[]") return null
+        val parsed = runCatching { JSONArray(m.attachments) }.getOrNull() ?: return null
+        val out = JSONArray()
+        for (i in 0 until parsed.length()) {
+            val a = parsed.optJSONObject(i) ?: continue
+            val id = a.optString("id")
+            // `type`; see the note in SignalThreadActivity.bindAttachment. Reading
+            // `contentType` here meant every Signal attachment fell back to
+            // application/octet-stream, so the browser offered a download instead of
+            // showing the picture.
+            val type = a.optString("type").ifBlank { "application/octet-stream" }
+            val name = a.optString("filename")
+            out.put(JSONObject().apply {
+                put("id", id)
+                if (id.isNotBlank()) put("url", "/api/signal/attachments/" + id)
+                put("type", type)
+                put("label", name.ifBlank { type })
+                put("isImage", type.startsWith("image"))
+                put("isVideo", type.startsWith("video"))
+                // Audio was the one kind with no branch in the browser, so a voice note
+                // arrived there as a download link -- the thing the phone stopped doing.
+                put("isAudio", type.startsWith("audio"))
+                // Not the same question as `isAudio`: a voice note is something somebody
+                // said, an audio file is something they attached. The browser labels them
+                // differently for the same reason the phone does.
+                put("isVoice", a.optBoolean("voice"))
+            })
+        }
+        return out.takeIf { it.length() > 0 }
+    }
+
+    /**
+     * Trusts a recipient's new safety number, so a blocked send can go.
+     *
+     * ⚠ The answer to the 409 from `handleSend`, and the reason that 409 carries a thread key
+     * rather than only a sentence. Accepting is a real decision about who somebody is talking
+     * to, so it is a separate, deliberate request -- never folded into a retry that a browser
+     * could make on its own.
+     *
+     * The browser resends afterwards rather than this doing it: the message it wants to send
+     * is still in its composer, and a server that remembered it would be holding a message
+     * somebody may have changed their mind about.
+     */
+    private fun handleSignalAcceptIdentity(session: IHTTPSession): Response {
+        if (!signalEnabled()) {
+            return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+        }
+        val threadKey = readSmallJsonField(session, "threadKey", MAX_ACTION_BODY_BYTES)?.trim().orEmpty()
+        if (threadKey.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "no conversation"))
+        }
+        val accepted = runCatching { signalRepository.acceptIdentity(threadKey) }
+            .onFailure { Timber.w(it, "Desktop Sync: accepting a safety number") }
+            .getOrDefault(false)
+
+        // ⚠ `acceptIdentity` returns false when nothing was accepted, and its own
+        // documentation says so precisely so a caller cannot report success wrongly. Passing
+        // that through matters here: a browser told "accepted" would resend straight into the
+        // same refusal and look like it was ignoring the button.
+        return if (accepted) {
+            jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+        } else {
+            jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", "that safety number could not be accepted")
+            )
+        }
+    }
+
+    /**
+     * Takes one of this account's own messages back, for everyone it reached.
+     *
+     * The phone has had this; the browser had not, so a message sent from the browser could
+     * only be withdrawn by picking the phone up -- which is the opposite of what Desktop Sync
+     * is for.
+     *
+     * ⚠ The window and the ownership rule are **not** re-implemented here. The repository
+     * refuses an outgoing-only, inside-the-window send and this reports that refusal, so the
+     * browser cannot come to a different answer than the phone's menu about the same message.
+     */
+    private fun handleSignalWithdraw(session: IHTTPSession): Response {
+        if (!signalEnabled()) {
+            return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+        }
+        val messageId = readSmallJsonField(session, "messageId", MAX_ACTION_BODY_BYTES)?.trim().orEmpty()
+        if (messageId.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "no message"))
+        }
+        return runCatching { signalRepository.withdraw(messageId) }
+            .fold(
+                onSuccess = {
+                    notifyChanged()
+                    jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+                },
+                onFailure = { failure ->
+                    Timber.w(failure, "Desktop Sync: withdrawing a Signal message")
+                    jsonResponse(
+                        Response.Status.INTERNAL_ERROR,
+                        JSONObject().put(
+                            "error",
+                            context.sayFailure(failure) ?: "that message could not be taken back"
+                        )
+                    )
+                }
+            )
+    }
+
+    /**
+     * One Signal attachment, by the id it is filed under.
+     *
+     * Fetched through the repository rather than off disk: the repository is what holds the
+     * pinned-TLS client that can fetch one that has not been kept yet.
+     *
+     * Whole in memory, which is the phone's own approach in its thread screen, and it is a
+     * real cost here rather than a nominal one -- the first video this was tried against was
+     * 27 MB. Acceptable because the alternative is a disk cache with its own eviction and
+     * lifetime, and this is a request the user made by opening the thread. Ranges are
+     * answered from the array we already hold, which is what a video element needs before
+     * it will let anyone seek.
+     */
+    private fun handleSignalAttachment(id: String, session: IHTTPSession): Response {
+        if (!signalEnabled()) {
+            return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+        }
+        val bytes = runCatching { signalRepository.loadAttachment(id) }.getOrNull()
+            ?: return jsonResponse(
+                Response.Status.NOT_FOUND,
+                JSONObject().put("error", "that attachment is no longer on the phone")
+            )
+        // See [sniffServedType]: what the browser must be told to draw or play a file.
+        val mime = sniffServedType(bytes)
+
+        val length = bytes.size.toLong()
+        val range = session.headers["range"]?.let { RANGE.find(it) }
+
+        if (range == null) {
+            return newFixedLengthResponse(
+                Response.Status.OK, mime, ByteArrayInputStream(bytes), length
+            ).apply {
+                addHeader("Accept-Ranges", "bytes")
+                // The bytes never change under an id, so let the browser keep them rather
+                // than pulling every picture in a thread over the network on each poll.
+                addHeader("Cache-Control", "private, max-age=86400")
+            }
+        }
+
+        val start = range.groupValues[1].toLongOrNull() ?: 0L
+        val end = range.groupValues[2].toLongOrNull()?.coerceAtMost(length - 1) ?: (length - 1)
+        if (start > end || start < 0) {
+            return jsonResponse(Response.Status.RANGE_NOT_SATISFIABLE, JSONObject().put("error", "bad range"))
+                .apply { addHeader("Content-Range", "bytes */$length") }
+        }
+
+        val count = (end - start + 1).toInt()
+        return newFixedLengthResponse(
+            Response.Status.PARTIAL_CONTENT, mime,
+            ByteArrayInputStream(bytes, start.toInt(), count), count.toLong()
+        ).apply {
+            addHeader("Accept-Ranges", "bytes")
+            addHeader("Content-Range", "bytes $start-$end/$length")
+            addHeader("Cache-Control", "private, max-age=86400")
+        }
+    }
+
+    /**
+     * Everything the phone offers on a conversation: archive, pin, mute, mark unread,
+     * block, delete. The browser had none of it -- a conversation could be read and
+     * replied to and nothing else, so tidying an inbox meant picking the phone up.
+     *
+     * One route rather than eight, because the shape is identical every time and the only
+     * real work is deciding which rail the id belongs to. The two rails do not offer quite
+     * the same set -- SMS has delete, and Signal's "delete" would clear only this device's
+     * copy -- so each rail answers for the actions it actually has.
+     */
+    private fun handleThreadAction(threadId: Long, session: IHTTPSession): Response {
+        val action = readSmallJsonField(session, "action", MAX_ACTION_BODY_BYTES)?.trim().orEmpty()
+        if (action.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "no action"))
+        }
+
+        signalThreadFor(threadId)?.let { thread ->
+            val key = thread.threadKey
+            // Checked before anything is done rather than after: a rejected action should
+            // leave the conversation as it found it.
+            if (action !in SIGNAL_THREAD_ACTIONS) {
+                return jsonResponse(
+                    Response.Status.BAD_REQUEST,
+                    JSONObject().put("error", "signal threads do not support \"" + action + "\"")
+                )
+            }
+            // One rule, in the repository, so this and the phone's two menus cannot
+            // disagree about what a single row means.
+            val done = runCatching {
+                val ok = signalRepository.actOnPerson(
+                    key,
+                    when (action) {
+                        "archive" -> SignalRepository.PersonAction.ARCHIVE
+                        "unarchive" -> SignalRepository.PersonAction.UNARCHIVE
+                        "pin" -> SignalRepository.PersonAction.PIN
+                        "unpin" -> SignalRepository.PersonAction.UNPIN
+                        "mute" -> SignalRepository.PersonAction.MUTE
+                        "unmute" -> SignalRepository.PersonAction.UNMUTE
+                        "unread" -> SignalRepository.PersonAction.UNREAD
+                        "block" -> SignalRepository.PersonAction.BLOCK
+                        else -> SignalRepository.PersonAction.UNBLOCK
+                    }
+                )
+                if (!ok) throw IllegalStateException("that did not work")
+            }
+            done.exceptionOrNull()?.let { failure ->
+                Timber.w(failure, "Desktop Sync: signal %s failed", action)
+                return jsonResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    JSONObject().put("error", failure.message ?: "that did not work")
+                )
+            }
+            return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+        }
+
+        runCatching {
+            when (action) {
+                "archive" -> conversationRepository.markArchived(threadId)
+                "unarchive" -> conversationRepository.markUnarchived(listOf(threadId))
+                "pin" -> conversationRepository.markPinned(threadId)
+                "unpin" -> conversationRepository.markUnpinned(threadId)
+                // Muting an SMS conversation is turning its notifications off. The phone
+                // writes the same preference, so the two surfaces cannot disagree.
+                "mute" -> prefs.notifications(threadId).set(false)
+                "unmute" -> prefs.notifications(threadId).set(true)
+                "unread" -> messageRepository.markUnread(listOf(threadId))
+                "block" -> conversationRepository.markBlocked(listOf(threadId), blockingManager(), null)
+                "unblock" -> conversationRepository.markUnblocked(threadId)
+                "delete" -> conversationRepository.deleteConversations(threadId)
+                else -> return jsonResponse(
+                    Response.Status.BAD_REQUEST,
+                    JSONObject().put("error", "no such action")
+                )
+            }
+        }.exceptionOrNull()?.let { failure ->
+            Timber.w(failure, "Desktop Sync: %s failed", action)
+            return jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", failure.message ?: "that did not work")
+            )
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /** The whole inbox, both rails, the same as the phone's overflow item. */
+    private fun handleMarkAllRead(): Response {
+        runCatching {
+            val ids = conversationRepository.getConversationsSnapshot(unreadAtTop = false)
+                .filter { it.unread }
+                .map { it.id }
+            // Through the interactor, as the per-conversation read and the phone's own menu
+            // item go: the repository alone set the flags and left every text notification,
+            // and the launcher's mark, behind a list that read as all done.
+            if (ids.isNotEmpty()) markRead.execute(ids)
+            if (signalEnabled()) {
+                signalRepository.getThreadsSnapshot(archived = false)
+                    .filter { it.unread > 0 }
+                    .forEach { signalRepository.markRead(it.threadKey, System.currentTimeMillis()) }
+            }
+        }.exceptionOrNull()?.let { failure ->
+            Timber.w(failure, "Desktop Sync: mark all read failed")
+            return jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", failure.message ?: "that did not work")
+            )
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /**
+     * The same person's conversation on the other rail, if they have one.
+     *
+     * This is what the phone's rail badge is built on: one person, two conversations, and
+     * a way across. Only for a one-to-one thread -- a Signal group and an MMS group are
+     * different groups with different membership, not two views of one conversation, which
+     * is why a group gets no badge on the phone either.
+     *
+     * Looked up when a thread is opened rather than sent with the list: the list is 339
+     * rows on this phone and polled every few seconds, and a directory lookup per row on
+     * every tick is a great deal of work to answer a question about the one thread someone
+     * is actually reading.
+     */
+    private fun handleThreadCross(threadId: Long): Response {
+        val notFound = JSONObject().put("found", false)
+        if (!signalEnabled()) return jsonResponse(Response.Status.OK, notFound)
+
+        signalThreadFor(threadId)?.let { thread ->
+            // Signal -> SMS. A group has no single counterpart to cross to.
+            if (thread.kind != "direct") return jsonResponse(Response.Status.OK, notFound)
+
+            // A link the user made by hand wins over any matching. It exists precisely for
+            // the pairs matching cannot see -- a contact whose Signal shares no number --
+            // and someone who has said these two are the same person should not be argued
+            // with by a number comparison.
+            signalRepository.linkedConversationId(thread.threadKey)?.let { linkedId ->
+                runCatching { conversationRepository.getConversation(linkedId) }.getOrNull()
+                    ?.let { conversation ->
+                        return jsonResponse(Response.Status.OK, JSONObject().apply {
+                            put("found", true)
+                            put("id", conversation.id)
+                            put("title", conversation.getTitle())
+                            put("rail", "sms")
+                            put("label", "SMS")
+                            put("linked", true)
+                        })
+                    }
+            }
+
+            val number = thread.counterpartNumber.takeIf { it.isNotBlank() }
+                ?: return jsonResponse(Response.Status.OK, JSONObject().put("found", false)
+                    .put("canLink", true))
+            val conversation = runCatching {
+                conversationRepository.getConversation(listOf(number))
+            }.getOrNull() ?: return jsonResponse(Response.Status.OK, notFound)
+            return jsonResponse(Response.Status.OK, JSONObject().apply {
+                put("found", true)
+                put("id", conversation.id)
+                put("title", conversation.getTitle())
+                put("rail", "sms")
+                put("label", "SMS")
+            })
+        }
+
+        val conversation = runCatching { conversationRepository.getConversation(threadId) }.getOrNull()
+            ?: return jsonResponse(Response.Status.OK, notFound)
+
+        // The same hand-made link, read the other way round.
+        signalRepository.linkedThreadKeyFor(threadId)?.let { key ->
+            val linked = (signalRepository.getThreadsSnapshot(archived = false) +
+                signalRepository.getThreadsSnapshot(archived = true))
+                .firstOrNull { it.threadKey == key }
+            if (linked != null) {
+                return jsonResponse(Response.Status.OK, JSONObject().apply {
+                    put("found", true)
+                    put("id", InboxItem.signalStableId(linked.threadKey))
+                    put("title", linked.title.ifBlank { linked.counterpartNumber })
+                    put("rail", "signal")
+                    put("label", "Signal")
+                    put("linked", true)
+                })
+            }
+        }
+
+        val recipients = conversation.recipients
+        if (recipients.size != 1) return jsonResponse(Response.Status.OK, notFound)
+        val address = recipients.firstOrNull()?.address?.takeIf { it.isNotBlank() }
+            ?: return jsonResponse(Response.Status.OK, notFound)
+        val signalThread = runCatching { signalRepository.findThreadForNumber(address) }.getOrNull()
+            ?: return jsonResponse(Response.Status.OK, JSONObject().put("found", false)
+                .put("canLink", true))
+        return jsonResponse(Response.Status.OK, JSONObject().apply {
+            put("found", true)
+            put("id", InboxItem.signalStableId(signalThread.threadKey))
+            put("title", signalThread.title.ifBlank { signalThread.counterpartNumber })
+            put("rail", "signal")
+            put("label", "Signal")
+        })
+    }
+
+    /**
+     * What the phone's Signal thread info screen shows: the safety number, and whether the
+     * key behind it is still the one that was accepted.
+     *
+     * A changed safety number is the one thing in a messenger that is worth interrupting
+     * someone for -- it means the key at the other end is not the key you last talked to,
+     * which is either a reinstall or somebody in the middle. The browser had no way to see
+     * it at all, so a reader who lived in the browser would never learn.
+     *
+     * The key store is asked live rather than a stored row read: a safety number that is
+     * out of date is worse than no safety number, because it is reassuring.
+     */
+    private fun handleThreadInfo(threadId: Long): Response {
+        val thread = signalThreadFor(threadId)
+            ?: return jsonResponse(
+                Response.Status.NOT_FOUND,
+                JSONObject().put("error", "safety numbers are a Signal idea; this is an SMS thread")
+            )
+        if (thread.kind != "direct") {
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject().put("error", "a group has one safety number per member, not one for the group")
+            )
+        }
+        val identity = runCatching { signalRepository.identity(thread.threadKey) }.getOrElse { failure ->
+            Timber.w(failure, "Desktop Sync: identity lookup")
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject().put("error", failure.message ?: "the phone could not answer that")
+            )
+        }
+        // A contact who has never exchanged a message has no identity record, which comes
+        // back as an empty string rather than an error. That is not a fault
+        // and must not be drawn as a blank safety number -- an empty monospace block looks
+        // like something that failed rather than something that does not exist yet.
+        val digits = identity.safetyNumber.filter { it.isDigit() }
+        if (digits.isEmpty()) {
+            return jsonResponse(Response.Status.OK, JSONObject().apply {
+                put("title", thread.title.ifBlank { thread.counterpartNumber })
+                put("pending", true)
+            })
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().apply {
+            put("title", thread.title.ifBlank { thread.counterpartNumber })
+            put("number", thread.counterpartNumber)
+            // Grouped the way Signal prints it, five digits at a time, because the only
+            // thing anyone does with a safety number is read it aloud to compare. Chunked
+            // from the digits alone: it arrives already spaced, and chunking that gave
+            // ragged groups like "03884 6641 6 163".
+            put("safetyNumber", digits.chunked(5).joinToString(" "))
+            put("verified", identity.verified)
+            put("changed", identity.changed)
+        })
+    }
+
+    /**
+     * Tie a Signal thread to an SMS conversation by hand, or untie it.
+     *
+     * Takes either id as the thread in the path and the other in the body, so the browser
+     * can offer it from whichever side the reader is on. Sending 0 unties.
+     *
+     * This exists because matching by phone number cannot see every pair. A contact with
+     * Signal's phone-number privacy on gives an ACI and nothing else, so there is nothing
+     * to compare and no way across in either direction -- however plain the pairing is to
+     * the person reading both threads. Nothing here is guessed: the link is only ever what
+     * someone said it is.
+     */
+    private fun handleThreadLink(threadId: Long, session: IHTTPSession): Response {
+        val other = readSmallJsonField(session, "other", MAX_ACTION_BODY_BYTES)?.trim()?.toLongOrNull()
+            ?: return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "no thread given"))
+
+        val signalThread = signalThreadFor(threadId)
+        val (key, conversationId) = when {
+            signalThread != null -> signalThread.threadKey to other
+            else -> {
+                if (other == 0L) {
+                    // Untying from the SMS side: find whichever Signal thread points here.
+                    val existing = signalRepository.linkedThreadKeyFor(threadId)
+                        ?: return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+                    existing to 0L
+                } else {
+                    val target = signalThreadFor(other)
+                        ?: return jsonResponse(
+                            Response.Status.BAD_REQUEST,
+                            JSONObject().put("error", "that is not a Signal conversation")
+                        )
+                    target.threadKey to threadId
+                }
+            }
+        }
+
+        runCatching {
+            signalRepository.linkConversation(key, conversationId.takeIf { it != 0L })
+        }.exceptionOrNull()?.let { failure ->
+            Timber.w(failure, "Desktop Sync: link")
+            return jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", failure.message ?: "that did not work")
+            )
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /**
+     * Delete one SMS or MMS message.
+     *
+     * SMS only, which is not an omission: there is no delete for a Signal message anywhere
+     * in this app, the phone's own Signal thread included, and a browser-only way to
+     * remove one would be a capability the device it syncs with does not have. The ids the
+     * browser holds for Signal messages are derived stable numbers rather than the real
+     * ones, so there would be nothing to address it by either.
+     */
+    private fun handleDeleteMessage(messageId: Long): Response {
+        runCatching { messageRepository.deleteMessages(listOf(messageId)) }
+            .exceptionOrNull()?.let { failure ->
+                Timber.w(failure, "Desktop Sync: delete message")
+                return jsonResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    JSONObject().put("error", failure.message ?: "that did not work")
+                )
+            }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /**
+     * The phone settings a browser can sensibly read and change.
+     *
+     * Deliberately not all of them. Notifications, delayed sending, MMS compression, the
+     * signature, accent stripping, screenshot blocking and link handling all act on the
+     * phone's own sending or its own screen; a browser quietly changing those would be
+     * reaching past what it is, which is a window onto the messages.
+     */
+    private fun handleGetSettings(): Response = jsonResponse(Response.Status.OK, JSONObject().apply {
+        put("unreadAtTop", prefs.unreadAtTop.get())
+        put("signalEnabled", prefs.signalEnabled.get())
+        put("signalWeave", prefs.signalWeave.get())
+        put("signalReadReceipts", prefs.signalReadReceipts.get())
+        put("vpnOnly", prefs.desktopSyncVpnOnly.get())
+        // Read-only, so the settings screen can say what it is talking to.
+        put("signalConfigured", signalRepository.isConfigured())
+    })
+
+    private fun handleSetSetting(session: IHTTPSession): Response {
+        val body = readSmallJson(session, MAX_ACTION_BODY_BYTES)
+            ?: return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "bad request body"))
+        val name = body.optString("name").trim()
+        val value = body.optString("value").trim() == "true"
+        when (name) {
+            "unreadAtTop" -> prefs.unreadAtTop.set(value)
+            "signalWeave" -> prefs.signalWeave.set(value)
+            "signalReadReceipts" -> prefs.signalReadReceipts.set(value)
+            // Signal is only offered once this phone is on the account, the same guard the
+            // phone's own switch has, so the browser cannot put it into a
+            // configured-but-broken state.
+            "signalEnabled" -> {
+                if (value && !signalRepository.isConfigured()) {
+                    return jsonResponse(
+                        Response.Status.BAD_REQUEST,
+                        JSONObject().put("error", "link this phone to Signal first")
+                    )
+                }
+                signalRepository.setEnabled(value)
+            }
+            // Turning this ON from a LAN browser would cut that browser off mid-request,
+            // which reads as the app breaking. Turning it off is allowed: that only ever
+            // widens what can reach the relay, and the person doing it is already through.
+            // "tailscaleOnly" is the old name, for a dashboard tab opened before the update.
+            "vpnOnly", "tailscaleOnly" -> {
+                if (value && !DesktopSyncService.isAllowedPeer(session.remoteIpAddress, context)) {
+                    return jsonResponse(
+                        Response.Status.BAD_REQUEST,
+                        JSONObject().put(
+                            "error",
+                            "that would disconnect this browser — turn it on from the phone, " +
+                                "or reach this page over your VPN first"
+                        )
+                    )
+                }
+                prefs.desktopSyncVpnOnly.set(value)
+            }
+            else -> return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "no such setting"))
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /** The phone's "Sync messages": re-read Android's own SMS store into the app. */
+    private fun handleSyncMessages(): Response {
+        // Fired and not awaited. A full sync walks every message on the device -- 6,485 on
+        // this phone -- and holding an HTTP request open for it would time out long before
+        // it finished and tell the browser it failed when it had not.
+        thread(isDaemon = true) {
+            runCatching { syncMessages.execute(Unit) }
+                .exceptionOrNull()?.let { Timber.w(it, "Desktop Sync: sync messages") }
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("started", true))
+    }
+
+    /**
+     * Messages waiting to go out later.
+     *
+     * Listed, and cancellable, but not composed here. Scheduling one needs a date and time
+     * picker and a decision about whose clock it is -- the browser's or the phone's, which
+     * are not always the same -- and the thing worth having first is being able to see
+     * that something is queued and stop it. A message you cannot see is the one that goes
+     * out when you did not want it to.
+     */
+    private fun handleScheduled(): Response {
+        val array = JSONArray()
+        runCatching { scheduledMessageRepository.getScheduledMessagesSnapshot() }
+            .getOrDefault(emptyList())
+            .forEach { m ->
+                array.put(JSONObject().apply {
+                    put("id", m.id)
+                    put("date", m.date)
+                    put("body", m.body)
+                    put("threadId", m.conversationId)
+                    // Who it goes to, resolved to names where the address book knows them:
+                    // a list of bare numbers is not something anyone can check at a glance.
+                    // A Signal row's "recipients" is the thread's name, not an address, so
+                    // there is nothing to look up -- and looking it up would turn a name
+                    // into whatever conversation happened to match it as a number.
+                    put("to", if (m.signalThreadKey.isNotEmpty()) {
+                        m.recipients.joinToString(", ")
+                    } else m.recipients.joinToString(", ") { address ->
+                        val conversation = runCatching {
+                            conversationRepository.getConversation(listOf(address))
+                        }.getOrNull()
+                        conversation?.getTitle()?.takeIf { it.isNotBlank() } ?: address
+                    })
+                    put("attachments", m.attachments.size)
+                    if (m.signalThreadKey.isNotEmpty()) put("rail", "signal")
+                })
+            }
+        return jsonResponse(Response.Status.OK, JSONObject().put("scheduled", array))
+    }
+
+    /**
+     * Put a message in the phone's scheduled list rather than sending it now.
+     *
+     * Text only, on both rails. An attachment staged here would have to survive until the
+     * alarm fires, which means copying it into the app's storage and cleaning it up if the
+     * message is later cancelled -- a queue with an owner, not a field on a row. Refused
+     * plainly instead, so nobody schedules a photo that quietly does not go.
+     */
+    private fun handleSchedule(threadId: Long, submission: Submission): Response {
+        if (submission.attachments.isNotEmpty() || submission.rejected > 0) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST,
+                JSONObject().put("error", "a scheduled message is text only")
+            )
+        }
+        val body = submission.body.trim()
+        if (body.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "nothing to send"))
+        }
+        if (submission.at <= System.currentTimeMillis()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "that time has gone"))
+        }
+
+        val signalThread = signalThreadFor(threadId)
+        val recipients: List<String>
+        val signalKey: String
+        val conversationId: Long
+        var separate = false
+        if (signalThread != null) {
+            // Signal threads are keyed by uuid and have no addresses. The thread's name
+            // rides in recipients so the scheduled list has something to show; nothing
+            // reads it as a number.
+            recipients = listOf(signalThread.title.ifBlank { "Signal" })
+            signalKey = signalThread.threadKey
+            conversationId = 0
+        } else {
+            val conversation = conversationRepository.getConversation(threadId)
+                ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "no such thread"))
+            recipients = conversation.recipients.map { it.address }
+            signalKey = ""
+            conversationId = conversation.id
+            separate = !conversation.sendAsGroup
+        }
+
+        return runCatching {
+            scheduledMessageRepository.saveScheduledMessage(
+                date = submission.at,
+                subId = submission.subId,
+                recipients = recipients,
+                sendAsGroup = recipients.size > 1 && signalKey.isEmpty() && !separate,
+                body = body,
+                attachments = emptyList(),
+                conversationId = conversationId,
+                signalThreadKey = signalKey
+            )
+            updateScheduledMessageAlarms.execute(Unit)
+            notifyChanged()
+            jsonResponse(Response.Status.OK, JSONObject().put("ok", true).put("scheduled", true))
+        }.getOrElse { failure ->
+            Timber.w(failure, "Desktop Sync: schedule")
+            jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", failure.message ?: "could not schedule that")
+            )
+        }
+    }
+
+    private fun handleCancelScheduled(id: Long): Response {
+        runCatching { scheduledMessageRepository.deleteScheduledMessage(id) }
+            .exceptionOrNull()?.let { failure ->
+                Timber.w(failure, "Desktop Sync: cancel scheduled")
+                return jsonResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    JSONObject().put("error", failure.message ?: "that did not work")
+                )
+            }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /**
+     * Who is blocked.
+     *
+     * The row menu could block someone and nothing could show it afterwards, so a block
+     * made by a mis-click was invisible and permanent from here -- the same shape of hole
+     * as offering Archive with nowhere for archived conversations to go. Unblocking is the
+     * existing action route, which already handles it.
+     *
+     * SMS only. Signal's block lives on the account rather than on a row here, so this
+     * phone has no list of it to show; saying nothing is better than showing a short list
+     * that looks complete.
+     */
+    private fun handleBlocked(): Response {
+        val array = JSONArray()
+        runCatching { conversationRepository.getBlockedConversationsSnapshot() }
+            .getOrDefault(emptyList())
+            .forEach { c ->
+                array.put(JSONObject().apply {
+                    put("id", c.id)
+                    put("title", c.getTitle())
+                    put("snippet", c.snippet ?: "")
+                    put("date", c.date)
+                    put("rail", "sms")
+                })
+            }
+        return jsonResponse(Response.Status.OK, JSONObject().put("blocked", array))
+    }
+
+    /**
+     * The inbox, or the archive when asked for it.
+     *
+     * The archive shelf exists because the browser can now file a conversation away, and
+     * a place things go into needs a place to look at them -- without this, archiving from
+     * the browser meant the conversation left the list and could only be found again on
+     * the phone.
+     */
+    private fun handleGetThreads(session: IHTTPSession): Response {
+        val archived = session.parameters["archived"]?.firstOrNull() == "1"
+        // A page just opened asked Signal for what it is holding: its first list waits for that,
+        // a few seconds at most, and then reads what it brought.
+        if (signalEnabled() && !signalCatchUp.awaitDone()) Timber.i("Desktop Sync: Signal's catch-up is slow; listing what is here")
+        runCatching { Realm.getDefaultInstance().use { it.refresh() } }
+        val conversations = conversationRepository
+            .getConversationsSnapshot(unreadAtTop = !archived, archived = archived)
+        val array = JSONArray()
+        val rows = mutableListOf<Pair<Long, JSONObject>>()
+        val signalThreads =
+            if (signalEnabled()) signalRepository.getThreadsSnapshot(archived = archived)
+            else emptyList()
+        val joins = buildMap {
+            signalThreads.forEach { t ->
+                joinedConversationId(t)
+                    ?.let { id -> runCatching { conversationRepository.getConversation(id) }.getOrNull() }
+                    ?.takeIf { it.isValid }
+                    ?.let { put(t.threadKey, it) }
+            }
+        }
+        val joinedIds = joins.values.mapTo(mutableSetOf()) { it.id }
+        conversations
+            .filterNot { it.blocked }
+            // One person, one row -- the rule the phone's inbox follows.
+            .filterNot { it.id in joinedIds }
+            .forEach { conversation -> rows += conversation.date to conversationJson(conversation) }
+        signalThreads.forEach { t ->
+            val row = signalThreadJson(t, joins[t.threadKey])
+            // Sorted on the same date the row shows, or the list and the row disagree.
+            rows += row.optLong("date", t.lastTs) to row
+        }
+        // One list, newest first, the same order the phone shows.
+        rows.sortedByDescending { it.first }.forEach { array.put(it.second) }
+        return jsonIfChanged(session, array)
+    }
+
+    private fun handleGetMessages(threadId: Long, session: IHTTPSession): Response {
+        signalThreadFor(threadId)?.let { thread ->
+            val requested = session.parameters["limit"]?.firstOrNull()?.toIntOrNull()
+            val limit = (requested ?: MESSAGE_PAGE_SIZE).coerceIn(1, MESSAGE_MAX_LIMIT)
+            // Only a group needs them; in a one-to-one thread the name is at the top of
+            // the screen and repeating it against every bubble is noise.
+            val senders = if (thread.kind == "group") {
+                runCatching { signalRepository.senderNamesFor(thread.threadKey) }
+                    .getOrDefault(emptyMap())
+            } else {
+                emptyMap()
+            }
+            // This rail and no other. One screen per rail, with the badge between them --
+            // mixing the two here left the badge leading somewhere that looked the same,
+            // which is no use to anybody wanting to see one rail on its own.
+            // Who reacted, by name. A group's whole membership, not only [senders]: someone who
+            // reacts and has never written in the thread is still a member with a name. Looked
+            // up only if some message on the page carries a reaction.
+            val members by lazy {
+                runCatching { signalRepository.mentionableNames(thread.threadKey) }
+                    .getOrDefault(emptyMap()) + senders
+            }
+            val reactorName: (String) -> String = { who ->
+                when {
+                    who == "me" -> "You"
+                    // One to one: whoever is not this account is the person the thread is with.
+                    thread.kind != "group" -> thread.title.ifBlank { who }
+                    // A uuid means nothing to a reader; a number at least can be recognised.
+                    else -> members[who] ?: if ('-' in who) "Someone" else who
+                }
+            }
+            val array = JSONArray()
+            signalRepository.getMessagesSnapshot(thread.threadKey, limit)
+                .forEach { array.put(signalMessageJson(it, senders, reactorName)) }
+            // The same envelope the SMS branch returns. A bare array here meant the browser
+            // read hasMore as false for every Signal thread, so "Load older messages" was
+            // never offered and a long conversation ended at its most recent page.
+            val total = signalRepository.countMessages(thread.threadKey)
+            return jsonIfChanged(session, JSONObject().apply {
+                put("total", total)
+                put("hasMore", total > limit)
+                put("messages", array)
+            })
+        }
+
+        // Only the tail of the thread by default: some conversations here run 600+
+        // messages and the browser re-fetches this every few seconds. `limit` lets the
+        // browser ask for more so older history is still reachable.
+        //
+        // Uses getMessagesSync (not the repo's limit overload) because that one can
+        // return findAllAsync results, which need a Looper thread — and NanoHTTPD
+        // serves each request on a plain worker thread.
+        val requested = session.parameters["limit"]?.firstOrNull()?.toIntOrNull()
+        val limit = (requested ?: MESSAGE_PAGE_SIZE).coerceIn(1, MESSAGE_MAX_LIMIT)
+
+        // Who is in this thread, so a group message can say who sent it. A one-to-one
+        // thread needs none of this: the name is at the top of the screen and repeating
+        // it against every bubble is noise.
+        val conversation = runCatching { conversationRepository.getConversation(threadId) }.getOrNull()
+        val recipients = conversation?.recipients.orEmpty()
+        val isGroup = recipients.size > 1
+        val senders = recipients.map { it.address to it.getDisplayName() }
+
+        val all = messageRepository.getMessagesSync(threadId)
+        val total = all.size
+        val array = JSONArray()
+        all.takeLast(limit).forEach { message ->
+            array.put(messageJson(message, if (isGroup) senders else emptyList(), senders))
+        }
+
+        // Wrapped in an object (not a bare array) so the browser knows whether older
+        // messages exist without having to guess from the count.
+        return jsonIfChanged(session, JSONObject().apply {
+            put("total", total)
+            put("hasMore", total > limit)
+            put("messages", array)
+        })
+    }
+
+    private fun handleSend(session: IHTTPSession, threadId: Long): Response {
+        val submission = readSubmission(session)
+            ?: return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "bad request body"))
+
+        // Send it later. Handled before either rail's send, because from here on the two
+        // branches differ and the scheduling does not: the phone holds the message and its
+        // own alarm sends it, exactly as it would for one scheduled on the phone.
+        if (submission.at > 0) {
+            return handleSchedule(threadId, submission)
+        }
+
+        signalThreadFor(threadId)?.let { thread ->
+            val body = submission.body.trim()
+            // A file that could not be staged never reaches submission.attachments, only
+            // submission.rejected. The SMS branch refuses the whole send for that reason;
+            // this one ignored it, so an unreadable picture was dropped and the browser was
+            // told the message went -- caption and all, photo silently missing.
+            rejectionResponse(submission)?.let { return it }
+            if (body.isEmpty() && submission.attachments.isEmpty()) {
+                return jsonResponse(
+                    Response.Status.BAD_REQUEST,
+                    JSONObject().put("error", "nothing to send")
+                )
+            }
+            // The same encoding the phone uses, from the same helper, so a picture sent
+            // from the browser arrives the same size and format as one sent by hand.
+            val encoded = mutableListOf<String>()
+            for (attachment in submission.attachments) {
+                val uri = runCatching {
+                    SignalAttachment.dataUri(context, attachment.uri)
+                }.getOrElse { failure ->
+                    val reason = if (failure is SignalAttachment.TooLarge) {
+                        "that file is too large to send over Signal"
+                    } else {
+                        "that file could not be read"
+                    }
+                    Timber.w(failure, "Desktop Sync: Signal attachment")
+                    // Refused, not dropped: a picture that silently did not go is worse
+                    // than one that says it did not.
+                    return jsonResponse(
+                        Response.Status.BAD_REQUEST, JSONObject().put("error", reason)
+                    )
+                }
+                encoded += uri
+            }
+            return try {
+                // The phone resolves the quote from its own copy of the thread, as it does for
+                // a reply written on the phone -- the browser only says which message.
+                signalRepository.send(thread.threadKey, body, encoded, submission.quoteTs)
+                notifyChanged()
+                jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+            } catch (changed: SafetyNumberChanged) {
+                // ⚠ Answered as a **decision**, not as an error string, and that distinction
+                // is the whole reason `SafetyNumberChanged` is a type. Its own documentation
+                // says a client owes the person the choice rather than the problem -- and the
+                // browser was doing precisely what that type was introduced to stop, failing
+                // the send with a sentence and leaving somebody to work out that the remedy
+                // lived on another screen. On the browser it was worse than that: there is no
+                // other screen, so the conversation was simply unsendable from here for ever.
+                //
+                // A changed key is routine -- a reinstall or a new phone produces one.
+                Timber.i("Desktop Sync: Signal send blocked by a changed safety number")
+                jsonResponse(
+                    Response.Status.CONFLICT,
+                    JSONObject()
+                        .put("error", changed.message ?: "the safety number changed")
+                        .put(
+                            "safetyNumber",
+                            JSONObject()
+                                .put("threadKey", changed.threadKey)
+                                // Null where the app has only an id: the browser says "them"
+                                // rather than showing somebody hexadecimal.
+                                .put("name", changed.name ?: JSONObject.NULL)
+                        )
+                )
+            } catch (t: Throwable) {
+                // Sending has no offline queue on purpose: better to say it did not go
+                // than to accept a message that never arrives.
+                Timber.w(t, "Desktop Sync: Signal send failed")
+                jsonResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    JSONObject().put("error", context.sayFailure(t) ?: "the message could not be sent")
+                )
+            }
+        }
+
+        rejectionResponse(submission)?.let { return it }
+
+        // A picture on its own is a message. Only require text when nothing else is attached.
+        if (submission.body.isBlank() && submission.attachments.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "missing body"))
+        }
+
+        val conversation = conversationRepository.getConversation(threadId)
+            ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "no such thread"))
+
+        val addresses = conversation.recipients.map { it.address }
+        val failed = sendAndWait(
+            conversation.id, addresses, conversation.sendAsGroup,
+            submission.body, submission.attachments
+        )
+        if (failed) return sendFailureResponse()
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /** What a compose request carried, however it was encoded. */
+    private class Submission(
+        val body: String,
+        val to: String,
+        val attachments: List<Attachment>,
+        /** Files that arrived but could not be used -- an image the phone cannot decode. */
+        val rejected: Int = 0,
+        /** The SIM the browser picked, or NO_SUB_ID to let the phone work it out. */
+        val subId: Int = NO_SUB_ID,
+        /** When to send it, or 0 for now. Epoch milliseconds, the phone's own clock. */
+        val at: Long = 0,
+        /** The sent timestamp of the Signal message this replies to, or 0. */
+        val quoteTs: Long = 0
+    )
+
+    /**
+     * Read a text field out of a multipart request.
+     *
+     * NanoHTTPD decodes a request body with the charset named in its Content-Type and falls back
+     * to **US-ASCII** when there is none -- and a browser writes the multipart Content-Type
+     * itself, boundary and all, so there is never a charset to find. Every byte above 127 becomes
+     * U+FFFD before this code sees it, and no amount of re-encoding gets it back: an em dash
+     * arrives as three replacement characters, and so does an emoji.
+     *
+     * So the browser sends each text field base64'd under a "B64" name. Base64 is pure ASCII and
+     * comes through any charset untouched, and the UTF-8 is decoded here. The plain field is
+     * still read as a fallback, for a client that doesn't know the convention.
+     */
+    private fun multipartText(session: IHTTPSession, field: String): String {
+        session.parameters["${field}B64"]?.firstOrNull()?.let { encoded ->
+            runCatching {
+                return String(android.util.Base64.decode(encoded, android.util.Base64.DEFAULT), Charsets.UTF_8)
+            }.onFailure { error -> Timber.w(error, "Desktop Sync: bad base64 in %s", field) }
+        }
+        return session.parameters[field]?.firstOrNull().orEmpty()
+    }
+
+    /**
+     * Refuse the whole send if any file could not be used, rather than quietly sending the text
+     * without the picture. Silently dropping an attachment is the worse failure: the message
+     * looks sent, and nobody finds out the photo never went until the reply asks what photo.
+     */
+    private fun rejectionResponse(submission: Submission): Response? =
+        submission.rejected
+            .takeIf { rejected -> rejected > 0 }
+            ?.let { rejected ->
+                jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put(
+                    "error",
+                    // Deliberately not "as a picture": contacts and video go through here too,
+                    // and a wrong reason is worse than a vague one.
+                    if (rejected == 1) "that file could not be read"
+                    else "$rejected of those files could not be read"
+                ))
+            }
+
+    /**
+     * Read a send from either encoding. Text-only sends still arrive as JSON, which is what the
+     * browser has always posted; anything with a file attached arrives as multipart, because a
+     * JSON body cannot carry bytes without base64 inflating them by a third.
+     *
+     * NanoHTTPD does the multipart parsing: parseBody() writes each file part to a temp file and
+     * puts its path in the map under the field name, while ordinary fields land in the session
+     * parameters. The temp files die with the request, so every one that matters is copied out
+     * by stageUpload() before this returns.
+     */
+    private fun readSubmission(session: IHTTPSession): Submission? {
+        val bodyMap = HashMap<String, String>()
+        runCatching { session.parseBody(bodyMap) }.onFailure { error ->
+            Timber.w(error, "Desktop Sync: could not parse a request body")
+            return null
+        }
+
+        val contentType = session.headers["content-type"].orEmpty()
+        if (!contentType.startsWith("multipart/form-data")) {
+            val json = runCatching { JSONObject(bodyMap["postData"] ?: "{}") }.getOrNull() ?: return null
+            return Submission(
+                json.optString("body"), json.optString("to"), emptyList(),
+                // A string either way, so the JSON and multipart bodies carry it identically.
+                subId = json.optString("subId").toIntOrNull() ?: NO_SUB_ID,
+                at = json.optString("at").toLongOrNull() ?: 0,
+                quoteTs = json.optString("quoteTs").toLongOrNull() ?: 0
+            )
+        }
+
+        val uploads = bodyMap
+            .filterKeys { field -> field.startsWith(ATTACHMENT_FIELD) }
+            .toSortedMap()
+            .map { (field, path) ->
+                // parameters holds the name the file was uploaded under, keyed by the same field.
+                val uploadedName = session.parameters[field]?.firstOrNull()
+                stageUpload(context, java.io.File(path), uploadedName)
+            }
+
+        return Submission(
+            body = multipartText(session, "body"),
+            to = multipartText(session, "to"),
+            attachments = uploads.filterNotNull(),
+            rejected = uploads.count { it == null },
+            subId = multipartText(session, "subId").toIntOrNull() ?: NO_SUB_ID,
+            at = multipartText(session, "at").toLongOrNull() ?: 0,
+            quoteTs = multipartText(session, "quoteTs").toLongOrNull() ?: 0
+        )
+    }
+
+    /**
+     * Streams an MMS attachment (picture, etc.) straight out of the MMS content
+     * provider, so pictures actually show up in the browser instead of appearing as
+     * empty bubbles.
+     */
+    private fun handlePart(partId: Long, session: IHTTPSession): Response {
+        val part = messageRepository.getPart(partId)
+            ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "no such part"))
+        var mime = part.type.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        var uri = part.getUri()
+
+        // A video the browser cannot decode is re-encoded once and served from the cache
+        // afterwards. Nothing else is touched: see VideoForBrowser for which codecs count.
+        if (mime.startsWith("video/")) {
+            val size = runCatching {
+                context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+            }.getOrNull()
+            VideoForBrowser.playableCopy(context, part.id, uri, size)?.let { playable ->
+                uri = android.net.Uri.fromFile(playable)
+                mime = "video/mp4"
+            }
+        }
+
+        // How long the part is. A picture does not care, but a video does: a browser
+        // will not play a stream whose length it does not know and cannot seek within,
+        // which is what a chunked response is. Everything below exists to answer
+        // "how big, and give me these bytes of it".
+        val length = runCatching {
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+        }.getOrNull()?.takeIf { it > 0 && it != AssetFileDescriptor.UNKNOWN_LENGTH }
+
+        fun open(): InputStream? = runCatching { context.contentResolver.openInputStream(uri) }.getOrNull()
+
+        if (length == null) {
+            // Length unknown: chunked is all that is left, and the browser will have to
+            // take what it is given.
+            val stream = open()
+                ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "part unreadable"))
+            return newChunkedResponse(Response.Status.OK, mime, stream).apply {
+                addHeader("Content-Disposition", "inline; filename=\"" + fileNameFor(part.id, mime) + "\"")
+            }
+        }
+
+        val range = session.headers["range"]?.let { RANGE.find(it) }
+        if (range == null) {
+            val stream = open()
+                ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "part unreadable"))
+            return newFixedLengthResponse(Response.Status.OK, mime, stream, length).apply {
+                addHeader("Accept-Ranges", "bytes")
+                addHeader("Content-Disposition", "inline; filename=\"" + fileNameFor(part.id, mime) + "\"")
+            }
+        }
+
+        val start = range.groupValues[1].toLongOrNull() ?: 0L
+        val end = range.groupValues[2].toLongOrNull()?.coerceAtMost(length - 1) ?: (length - 1)
+        if (start > end || start >= length) {
+            return jsonResponse(Response.Status.RANGE_NOT_SATISFIABLE, JSONObject().put("error", "bad range"))
+                .apply { addHeader("Content-Range", "bytes */$length") }
+        }
+
+        val stream = open()
+            ?: return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "part unreadable"))
+        // The provider's stream is not seekable, so the only way to the offset is to
+        // read past it. Requests start at zero and walk forward, so this is cheap in
+        // practice and correct in every case.
+        var skipped = 0L
+        while (skipped < start) {
+            val n = stream.skip(start - skipped)
+            if (n <= 0) break
+            skipped += n
+        }
+        return newFixedLengthResponse(
+            Response.Status.PARTIAL_CONTENT, mime, stream, end - start + 1
+        ).apply {
+            addHeader("Accept-Ranges", "bytes")
+            addHeader("Content-Range", "bytes $start-$end/$length")
+            addHeader("Content-Disposition", "inline; filename=\"" + fileNameFor(part.id, mime) + "\"")
+        }
+    }
+
+    /** A name to save it under, since the URL is a bare number. */
+    private fun fileNameFor(partId: Long, mime: String): String {
+        val extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)
+        return if (extension.isNullOrBlank()) "part-$partId" else "part-$partId.$extension"
+    }
+
+    /**
+     * Reading a thread in the browser should clear it on the phone too. Goes through
+     * the MarkRead interactor rather than the repository directly, so the phone's
+     * notification is dismissed and the launcher badge updated as well — not just
+     * the database flag.
+     */
+    private fun handleMarkRead(threadId: Long): Response {
+        signalThreadFor(threadId)?.let { thread ->
+            // This rail only: the two are separate screens, and reading one of them is not
+            // a claim to have read the other. The row stays marked unread while the text
+            // half still is, which is the truth and is one tap of the badge away.
+            signalRepository.markRead(thread.threadKey, System.currentTimeMillis())
+            notifyChanged()
+            return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+        }
+        markRead.execute(listOf(threadId))
+        notifyChanged()
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+    }
+
+    /**
+     * The SIMs that can send, for the composer's picker.
+     *
+     * Empty with one SIM, and empty again without the phone permission -- either way there is
+     * no choice to offer, and the browser draws no control. Only a phone with two live
+     * subscriptions has a question to ask, which is the same rule the phone's own compose bar
+     * follows: the toggle is there when there is something to toggle between.
+     */
+    private fun handleSims(): Response {
+        val subs = runCatching { subscriptionManager.activeSubscriptionInfoList }
+            .getOrDefault(emptyList())
+        val array = JSONArray()
+        if (subs.size > 1) {
+            subs.forEach { sub ->
+                array.put(JSONObject().apply {
+                    put("subId", sub.subscriptionId)
+                    put("slot", sub.simSlotIndex + 1)
+                    // The carrier's name for it. The compat getter declares this non-null, so a
+                    // phone that reports none throws on the way out rather than returning null;
+                    // the slot number reads perfectly well alone, and the browser handles a blank.
+                    put("name", runCatching { sub.displayName.toString().trim() }.getOrDefault(""))
+                })
+            }
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("sims", array))
+    }
+
+    /**
+     * Does a conversation already exist for this recipient? Lets the compose field
+     * jump straight into an existing thread (with its history) instead of opening a
+     * blank one when you pick a contact you've already been texting.
+     */
+    private fun handleThreadFor(session: IHTTPSession): Response {
+        val address = session.parameters["address"]?.firstOrNull()?.trim().orEmpty()
+        if (address.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "missing address"))
+        }
+        val conversation = runCatching {
+            conversationRepository.getConversation(listOf(address))
+        }.getOrNull()
+        val result = JSONObject()
+        if (conversation != null) {
+            result.put("found", true)
+            result.put("threadId", conversation.id)
+            result.put("title", conversation.getTitle())
+        } else {
+            result.put("found", false)
+        }
+
+        // Whether this person is also on Signal, so the composer can offer that rail.
+        // Without it, picking a contact in the browser always started an SMS -- while the
+        // phone, given the same contact, shows a badge and can begin a Signal conversation
+        // instead. Signal's directory gives a thread per contact, so it already exists; it
+        // simply has no messages in it yet.
+        if (signalEnabled()) {
+            runCatching { signalRepository.findThreadForNumber(address) }.getOrNull()
+                ?.let { thread ->
+                    result.put("signalThreadId", InboxItem.signalStableId(thread.threadKey))
+                    result.put("signalTitle", thread.title.ifBlank { thread.counterpartNumber })
+                }
+        }
+        return jsonResponse(Response.Status.OK, result)
+    }
+
+    /**
+     * Contact lookup for the compose field's autocomplete. Matches on name or number,
+     * digits-only for the number comparison so "5551234567" finds "(555) 123-4567".
+     */
+    private fun handleContacts(session: IHTTPSession): Response {
+        val query = session.parameters["q"]?.firstOrNull()?.trim().orEmpty()
+        val array = JSONArray()
+        if (query.length < 2) return jsonResponse(Response.Status.OK, array)
+
+        val needle = query.lowercase()
+        val needleDigits = query.filter { it.isDigit() }
+
+        val contacts = runCatching { contactRepository.getUnmanagedAllContacts() }.getOrNull().orEmpty()
+        contacts.asSequence()
+            .flatMap { contact ->
+                contact.numbers.asSequence().map { number -> contact.name to number.address }
+            }
+            .filter { (name, address) ->
+                name.lowercase().contains(needle) ||
+                    (needleDigits.isNotEmpty() && address.filter { it.isDigit() }.contains(needleDigits))
+            }
+            .distinctBy { (name, address) -> name + '|' + address }
+            .take(8)
+            .forEach { (name, address) ->
+                array.put(JSONObject().put("name", name).put("address", address))
+            }
+
+        return jsonResponse(Response.Status.OK, array)
+    }
+
+    /** Start a brand-new conversation with an arbitrary recipient (the "+" button). */
+    private fun handleCompose(session: IHTTPSession): Response {
+        val submission = readSubmission(session)
+            ?: return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "bad request body"))
+
+        rejectionResponse(submission)?.let { return it }
+
+        val body = submission.body
+        val rawTo = submission.to
+        if (body.isBlank() && submission.attachments.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "missing body"))
+        }
+
+        // Accept a comma/semicolon separated list so a group message is possible too.
+        val addresses = rawTo.split(',', ';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        if (addresses.isEmpty()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "missing recipient"))
+        }
+
+        // Resolve the conversation up front so its id can be handed back to the browser,
+        // which then jumps straight into the thread. The interactor resolves the same
+        // conversation from the same addresses.
+        // A new chat starts as Settings > Group messages says; one already there keeps its
+        // own choice, as it does on the phone.
+        val conversation = runCatching {
+            conversationRepository.getOrCreateConversation(addresses, prefs.sendAsGroup.get())
+        }.getOrNull()
+        val threadId = conversation?.id
+        val sendAsGroup = addresses.size > 1 && (conversation?.sendAsGroup ?: prefs.sendAsGroup.get())
+
+        val failed = sendAndWait(
+            threadId ?: 0L, addresses, sendAsGroup, body, submission.attachments,
+            chosenSubId = submission.subId
+        )
+        if (failed) return sendFailureResponse()
+
+        return jsonResponse(Response.Status.OK, JSONObject().apply {
+            put("ok", true)
+            if (threadId != null && threadId != 0L) put("threadId", threadId)
+        })
+    }
+
+    /**
+     * Which SIM to send from.
+     *
+     * -1 means "unspecified", and SmsManagerFactory turns that into SmsManager.getDefault().
+     * With one SIM that is right, and naming a subscription would only be a way to get it
+     * wrong. With two it hands the send to whatever the system default resolves to, which on
+     * a dual-SIM phone can be no usable subscription at all: the message is marked failed on
+     * the phone while the browser, which asked for it, is told nothing. So once there is more
+     * than one active subscription, say which one.
+     *
+     * An explicit [chosen] subscription wins: that is the browser's SIM picker, which stands in
+     * for the toggle the phone's own compose bar has. Failing that the thread's most recent
+     * message decides -- answer on the SIM the conversation is already happening on, which is
+     * what the phone does. A new thread nobody chose for, or one whose last message came in on a
+     * SIM that has since been removed, falls back to the system's default SMS subscription, and
+     * then to the first active one.
+     */
+    private fun subIdFor(threadId: Long, chosen: Int = NO_SUB_ID): Int {
+        val subs = runCatching { subscriptionManager.activeSubscriptionInfoList }
+            .getOrDefault(emptyList())
+        // Also the empty list you get without the phone permission: nothing to choose between.
+        if (subs.size < 2) return NO_SUB_ID
+
+        val ids = subs.map { it.subscriptionId }
+
+        // Someone said which SIM. That settles it -- checked against the active list rather
+        // than trusted, since the browser may be holding a list from before a SIM was pulled.
+        if (chosen in ids) return chosen
+
+        // Messages come back sorted by date ascending, so the last one is the newest.
+        val threadSubId = runCatching {
+            messageRepository.getMessagesSync(threadId).lastOrNull()?.subId
+        }.getOrNull()
+        if (threadSubId != null && threadSubId in ids) return threadSubId
+
+        val systemDefault =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                SubscriptionManager.getDefaultSmsSubscriptionId()
+            } else NO_SUB_ID
+        if (systemDefault in ids) return systemDefault
+
+        return ids.first()
+    }
+
+    /**
+     * Send through the SendNewMessage interactor, NOT messageRepository.sendNewMessages()
+     * directly. The message transmits either way, but only the interactor also runs
+     * conversationRepo.updateConversations()/markUnarchived() — and without that, the
+     * conversation LIST keeps showing the previous message and timestamp, on the phone as
+     * well as in the browser, since both read the same Realm Conversation objects. Same
+     * lesson as read-state going through MarkRead rather than the repository.
+     */
+    private fun sendAndWait(
+        threadId: Long,
+        addresses: List<String>,
+        sendAsGroup: Boolean,
+        body: String,
+        attachments: List<Attachment> = emptyList(),
+        chosenSubId: Int = NO_SUB_ID,
+    ): Boolean {
+        val done = java.util.concurrent.CountDownLatch(1)
+        sendNewMessage.execute(
+            SendNewMessage.Params(
+                subId = subIdFor(threadId, chosenSubId),
+                threadId = threadId,
+                addresses = addresses,
+                body = body,
+                sendAsGroup = sendAsGroup,
+                attachments = attachments,
+            )
+        ) { done.countDown() }
+        // Bounded wait: the interactor is asynchronous, and returning before it finishes
+        // would have the browser reload a database that hasn't been written yet. Capped so
+        // a stalled send can't hold the HTTP response open indefinitely.
+        runCatching { done.await(10, java.util.concurrent.TimeUnit.SECONDS) }
+        notifyChanged()
+        return sendAlreadyFailed(threadId)
+    }
+
+    /**
+     * Did that send come straight back failed?
+     *
+     * Sending is asynchronous -- the phone hands the message to the radio and the outcome
+     * arrives some time later -- so a message still in flight is not an error, and says
+     * nothing here. A refusal the phone can make on the spot, though (no usable
+     * subscription, no radio at all), has already landed by the time this runs, and the
+     * person waiting on the other end of the browser should be told now rather than left
+     * looking at a bubble that appears to have gone. Anything that fails later is carried
+     * by the message's own status instead.
+     */
+    private fun sendAlreadyFailed(threadId: Long): Boolean = runCatching {
+        messageRepository.getMessagesSync(threadId).lastOrNull()
+            ?.takeIf { it.isMe() }
+            ?.isFailedMessage() == true
+    }.getOrDefault(false)
+
+    /**
+     * Not a 500: nothing here went wrong. The phone was asked to send and would not, and the
+     * browser needs to say so and keep the message in the box so it can be tried again.
+     */
+    private fun sendFailureResponse(): Response = jsonResponse(
+        Response.Status.SERVICE_UNAVAILABLE,
+        JSONObject().put("error", "the phone could not send this")
+    )
+
+    private fun conversationJson(conversation: Conversation) = JSONObject().apply {
+        put("id", conversation.id)
+        put("title", conversation.getTitle())
+        put("snippet", conversation.snippet ?: "")
+        put("date", conversation.date)
+        put("unread", conversation.unread)
+        put("rail", "sms")
+        // What the row's own menu needs to label itself: an item that says "Pin" on an
+        // already-pinned conversation is worse than no item.
+        put("pinned", conversation.pinned)
+        put("muted", !prefs.notifications(conversation.id).get())
+        put("archived", conversation.archived)
+        put("blocked", conversation.blocked)
+    }
+
+    /**
+     * [senders] is the thread's recipients, and is empty unless this is a group. When it
+     * is not, a received message carries the name of whoever sent it: in a group every
+     * bubble otherwise looks the same and the conversation reads as one voice.
+     *
+     * Matched with [PhoneNumberUtils.compare] rather than string equality, because the
+     * address on a message and the address on a recipient are frequently the same number
+     * written two ways — +1 and a bare ten digits, or spaced and not.
+     */
+    private fun messageJson(
+        message: Message,
+        senders: List<Pair<String, String>> = emptyList(),
+        // Every recipient, group or not, to name whoever reacted.
+        recipients: List<Pair<String, String>> = emptyList()
+    ) = JSONObject().apply {
+        put("id", message.id)
+        put("body", message.getText())
+        put("date", message.date)
+        put("isMe", message.isMe())
+        put("read", message.read)
+        // Which SIM carried it. The phone's own thread marks this where it changes, and
+        // without it the browser was the one place two numbers looked like one: a reader
+        // with a work SIM and a personal one could not tell which they had just answered
+        // on. Sent on every message; whether it is worth drawing is the browser's call,
+        // and on the single-SIM phone it never is.
+        put("subId", message.subId)
+        // How the send went. Without this the browser has no way to know a message
+        // failed -- it drew the bubble the moment the phone accepted the message for
+        // sending, and a bubble is what a sent message looks like too. Only outgoing
+        // messages have a state worth reporting.
+        if (message.isMe()) {
+            put("status", when {
+                message.isFailedMessage() -> "failed"
+                message.isSending() -> "sending"
+                else -> "sent"
+            })
+        }
+        if (senders.isNotEmpty() && !message.isMe()) {
+            val address = message.address.takeIf { it.isNotBlank() }
+            val name = address?.let { from ->
+                senders.firstOrNull { (recipient, _) -> PhoneNumberUtils.compare(recipient, from) }?.second
+                    ?: from
+            }
+            if (name != null) put("from", name)
+        }
+        // MMS attachments: without these, a picture message renders as an empty
+        // bubble in the browser. SMIL is layout metadata, and text/plain is already
+        // folded into getText() above, so both are skipped.
+        val attachments = JSONArray()
+        message.parts
+            .filterNot { it.type == "application/smil" || it.type == "text/plain" }
+            .forEach { part ->
+                attachments.put(JSONObject().apply {
+                    put("id", part.id)
+                    // Where to fetch it. Sent rather than assembled in the browser because
+                    // the two rails keep their attachments in different places and answer
+                    // on different routes -- letting the row say where it lives means the
+                    // browser draws a Signal photo and an MMS photo with the same code.
+                    put("url", "/api/parts/${part.id}")
+                    put("type", part.type)
+                    put("label", part.getSummary() ?: part.type)
+                    put("isImage", part.type.startsWith("image"))
+                    put("isVideo", part.type.startsWith("video"))
+                    // MMS carries recordings too -- the composer has always been able to
+                    // make them -- and they reached the browser as a download link for the
+                    // same reason Signal's did. MMS has no voice-note flag, so these are
+                    // audio and are not claimed to be more than that.
+                    put("isAudio", part.type.startsWith("audio"))
+                    put("isVoice", false)
+                })
+            }
+        if (attachments.length() > 0) put("attachments", attachments)
+        // Reactions on this message, counted per emoji, in the same shape the Signal rail
+        // sends. Without these the phone showed a reaction the browser did not.
+        if (message.emojiReactions.isNotEmpty()) {
+            val mine = message.emojiReactions
+                .firstOrNull { it.senderAddress == EmojiReactionRepository.ME }?.emoji
+            put("reactions", JSONArray().apply {
+                message.emojiReactions.groupingBy { it.emoji }.eachCount()
+                    .entries.sortedByDescending { it.value }
+                    .forEach { (emoji, n) ->
+                        put(JSONObject().put("emoji", emoji).put("count", n).apply {
+                            if (emoji == mine) put("mine", true)
+                            put("names", JSONArray(message.emojiReactions
+                                .filter { it.emoji == emoji }
+                                .map { r ->
+                                    if (r.senderAddress == EmojiReactionRepository.ME) "You"
+                                    else recipients.firstOrNull { (address, _) ->
+                                        PhoneNumberUtils.compare(address, r.senderAddress)
+                                    }?.second ?: r.senderAddress
+                                }))
+                        })
+                    }
+            })
+        }
+    }
+
+    /**
+     * [body] as a 200 with an ETag, or an empty 304 when the browser already holds it.
+     *
+     * For the two routes the page polls. Every poll used to send the whole thread list and the
+     * whole open conversation whether anything had changed or not: on 2026-09-30 that was about
+     * 900 MB up from the phone in an afternoon and evening, some of it over cellular, waking the
+     * radio every few seconds. Nearly every poll finds nothing new, so nearly every answer is now
+     * a few bytes. The page sends If-None-Match itself rather than leaning on the HTTP cache,
+     * which a browser may refuse to keep for a self-signed certificate.
+     */
+    private fun jsonIfChanged(session: IHTTPSession, body: Any): Response {
+        val text = body.toString()
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+        val etag = "\"" + digest.take(12).joinToString("") { "%02x".format(it) } + "\""
+        if (session.headers["if-none-match"] == etag) {
+            return newFixedLengthResponse(Response.Status.NOT_MODIFIED, "application/json", "").apply {
+                addHeader("ETag", etag)
+            }
+        }
+        return newFixedLengthResponse(Response.Status.OK, "application/json", text).apply {
+            addHeader("ETag", etag)
+        }
+    }
+
+    private fun jsonResponse(status: Response.Status, body: Any): Response {
+        val text = when (body) {
+            is JSONArray -> body.toString()
+            else -> body.toString()
+        }
+        return newFixedLengthResponse(status, "application/json", text)
+    }
+}
+
+/**
+ * Sent to every open socket with each ping pass. The page treats a socket that has heard nothing
+ * for longer than its SOCKET_SILENT_MS (app.js) as dead and opens another, and does not refetch
+ * on this message. File-scope so its test can see it.
+ */
+internal const val ALIVE_PAYLOAD = "{\"type\":\"alive\"}"
+
+/**
+ * Whether a WebSocket exception is the far end going away rather than something being wrong.
+ *
+ * ⚠ A browser tab closing, a laptop sleeping, wifi changing hands: each of those ends the
+ * socket from the other side, and each used to be logged as a warning with a full stack trace.
+ * Fourteen lines saying that the thing which is supposed to happen happened — which is how a
+ * log stops being read, and the next real fault goes past unnoticed.
+ *
+ * By type where the type says it, and by message where only the message does: the socket layer
+ * reports most of these as a plain [java.net.SocketException], so the text is the only thing
+ * separating "they closed the tab" from a genuine fault. Anything not listed here stays loud,
+ * because an exception on this socket that is *not* a disconnect is the interesting kind.
+ *
+ * File-scope and internal so the rule can be tested without a running server.
+ */
+internal fun isOrdinaryDisconnect(exception: IOException): Boolean {
+    if (exception is java.io.EOFException) return true
+    if (exception is java.net.SocketTimeoutException) return true
+    val text = (exception.message ?: "").lowercase()
+    return text.contains("connection abort") ||
+        text.contains("connection reset") ||
+        text.contains("broken pipe") ||
+        text.contains("socket closed") ||
+        text.contains("stream closed")
+}
+
+/**
+ * The content type to serve an attachment as, from its first bytes.
+ *
+ * Sniffed because the id does not carry a type and the row that named it is not to hand at
+ * the point it is served. Only the kinds the browser has to be told about in order to
+ * **draw** or **play** them; anything else is offered as a download, where a type is not
+ * needed and guessing one wrongly is worse than saying nothing.
+ *
+ * Top level rather than in the companion, which is private, so the byte tests can be
+ * exercised. They are the kind that look obviously right and are not -- see the AAC row.
+ */
+internal fun sniffServedType(bytes: ByteArray): String = when {
+        bytes.size > 3 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() -> "image/jpeg"
+        bytes.size > 8 && bytes[0] == 0x89.toByte() && bytes[1] == 'P'.code.toByte() -> "image/png"
+        bytes.size > 12 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp" -> "video/mp4"
+        bytes.size > 3 && bytes[0] == 'G'.code.toByte() && bytes[1] == 'I'.code.toByte() -> "image/gif"
+        // What this app records for Signal: raw ADTS AAC.
+        //
+        // ⚠ The test is `0xF6`, not `0xF0`, and the extra bit is the whole difference
+        // between AAC and MP3. Both begin with an eleven-bit sync run, so both match
+        // `FF Fx`; what separates them is the two-bit layer field, which ADTS requires to
+        // be 00 and every MPEG audio layer sets to something else. Masking only the top
+        // nibble would serve an MP3 as `audio/aac`.
+        //
+        // ⚠ Ordered after JPEG deliberately, though they cannot collide -- JPEG is FF D8
+        // and D8 masks to D0, never F0. Kept in this order so the reasoning does not have
+        // to be redone if a looser audio test is ever added.
+        bytes.size > 2 && bytes[0] == 0xFF.toByte() &&
+            (bytes[1].toInt() and 0xF6) == 0xF0 -> "audio/aac"
+        // Opus or Vorbis in Ogg, which is what some other Signal clients send.
+        bytes.size > 4 && String(bytes, 0, 4, Charsets.US_ASCII) == "OggS" -> "audio/ogg"
+        // AMR, from an MMS recording made by this app's own composer.
+        bytes.size > 6 && String(bytes, 0, 6, Charsets.US_ASCII) == "#!AMR\n" -> "audio/amr"
+        else -> "application/octet-stream"
+    }
+
+/**
+ * The desktop entry for [url], pulled out of the server so its exact text can be tested.
+ *
+ * Prefers a Chromium browser in app mode, which gives a window with no tab strip or address
+ * bar and its own entry in the menu and the switcher: installed normally, or as a Flatpak,
+ * which is how many Linux desktops carry Brave and Chrome. Falls back to xdg-open, so on a
+ * machine with none of them this still opens the right page in whatever browser that person
+ * actually uses.
+ *
+ * The quoting is the desktop-entry spec's, and it matters: desktop-file-validate rejected the
+ * old single-quoted script outright. The script is one double-quoted argument, in which a $
+ * must be written \$, and the file format doubles that backslash again, so the file holds
+ * \\$. Inside the script the address is single-quoted, because its ? would otherwise be a
+ * filename wildcard, and any % is doubled, because % begins the spec's field codes.
+ */
+internal fun desktopEntryFor(url: String): String {
+    val u = url.replace("%", "%%")
+    val script = "for b in brave-browser brave chromium chromium-browser " +
+        "google-chrome google-chrome-stable microsoft-edge vivaldi; do " +
+        "command -v \\\\\$b >/dev/null 2>&1 && exec \\\\\$b --app='$u'; done; " +
+        "for f in com.brave.Browser com.google.Chrome org.chromium.Chromium com.microsoft.Edge " +
+        "com.vivaldi.Vivaldi; do flatpak info \\\\\$f >/dev/null 2>&1 && " +
+        "exec flatpak run \\\\\$f --app='$u'; done; exec xdg-open '$u'"
+    return """
+        [Desktop Entry]
+        Type=Application
+        Name=Messaging
+        Comment=Text from this computer, through the phone
+        Exec=sh -c "$script"
+        Icon=messaging
+        Categories=Network;InstantMessaging;
+        Terminal=false
+    """.trimIndent() + "\n"
+}

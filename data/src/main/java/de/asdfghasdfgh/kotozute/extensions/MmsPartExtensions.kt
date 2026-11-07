@@ -1,0 +1,36 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.extensions
+
+import com.google.android.mms.ContentType
+import de.asdfghasdfgh.kotozute.model.MmsPart
+
+fun MmsPart.isSmil() = ContentType.APP_SMIL.lowercase() == type.lowercase()
+
+fun MmsPart.isImage() = ContentType.isImageType(type.lowercase())
+
+fun MmsPart.isVideo() = ContentType.isVideoType(type.lowercase())
+
+fun MmsPart.isAudio() = ContentType.isAudioType(type.lowercase())
+
+fun MmsPart.isText() = ContentType.TEXT_PLAIN.lowercase() == type.lowercase()
+
+// Both spellings: "text/x-vcard" is what phones have sent for years, "text/vcard" is the
+// registered one and what some newer senders use. A card under either is the same card.
+fun MmsPart.isVCard() = type.lowercase() == ContentType.TEXT_VCARD.lowercase() || type.lowercase() == "text/vcard"

@@ -25,10 +25,10 @@
     android:layout_height="match_parent"
     android:background="?android:attr/windowBackground"
     android:orientation="vertical"
-    tools:context="com.wanderwildwood.kotozute.feature.compose.ComposeActivity">
+    tools:context="de.asdfghasdfgh.kotozute.feature.compose.ComposeActivity">
 
     <!-- The conversation's pinned messages, kept on this phone. See SmsPins. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/pinnedBar"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -64,7 +64,7 @@
     <!-- A word, where a spinner used to turn. The conversation is being read off the
          database and there is nothing to show yet; saying so costs one redraw, and the
          spinner cost one for every frame it turned. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/loading"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -96,7 +96,7 @@
         app:layout_constraintBottom_toBottomOf="@id/sendAsGroupSummary"
         app:layout_constraintTop_toBottomOf="@id/toolbar" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/sendAsGroupTitle"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -111,7 +111,7 @@
         app:layout_constraintTop_toTopOf="@id/sendAsGroupBackground"
         app:textSize="primary" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/sendAsGroupSummary"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -123,7 +123,7 @@
         app:layout_constraintTop_toBottomOf="@id/sendAsGroupTitle"
         app:textSize="secondary" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkSwitch
+    <de.asdfghasdfgh.kotozute.common.widget.QkSwitch
         android:id="@+id/sendAsGroupSwitch"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -151,7 +151,7 @@
     <!-- Only when the draft has re-encoded itself. It sits above the divider and the list
          ends above it, so nothing is covered on the one screen where a covered message
          would be the message being answered. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/encodingNotice"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -198,7 +198,7 @@
         android:visibility="gone"
         app:constraint_referenced_ids="scheduledTitle,scheduledTime,scheduledCancel,scheduledSeparator" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/scheduledTitle"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -215,7 +215,7 @@
         app:layout_constraintVertical_chainStyle="packed"
         app:textSize="secondary" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/scheduledTime"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -265,7 +265,7 @@
         tools:listitem="@layout/attachment_file_list_item"
         android:scrollbars="none" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkEditText
+    <de.asdfghasdfgh.kotozute.common.widget.QkEditText
         android:id="@+id/message"
         style="@style/TextPrimary"
         android:layout_width="0dp"
@@ -289,7 +289,7 @@
         app:layout_constraintStart_toStartOf="@id/messageBackground">
 
         <requestFocus />
-    </com.wanderwildwood.kotozute.common.widget.QkEditText>
+    </de.asdfghasdfgh.kotozute.common.widget.QkEditText>
 
     <ImageView
         android:id="@+id/sim"
@@ -306,7 +306,7 @@
 
     <!-- Under the 16sp floor on purpose: the SIM's number is a figure drawn inside the
          24dp SIM-card icon (like an icon's glyph), not text to read; 16 would overflow it. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/simIndex"
         android:layout_width="0dp"
         android:layout_height="0dp"
@@ -321,7 +321,7 @@
         tools:ignore="SpUsage"
         tools:text="1" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/counter"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
@@ -390,7 +390,7 @@
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
-                <com.wanderwildwood.kotozute.common.widget.QkTextView
+                <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                     android:id="@+id/toolbarTitle"
                     style="@style/ToolbarText"
                     android:layout_width="0dp"
@@ -399,7 +399,7 @@
                     android:textDirection="ltr"
                     tools:text="Moez Bhatti" />
 
-                <com.wanderwildwood.kotozute.common.widget.QkTextView
+                <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                     android:id="@+id/railBadge"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
@@ -422,7 +422,7 @@
 
             </LinearLayout>
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/toolbarSubtitle"
                 style="@style/ToolbarText"
                 android:textColor="?android:attr/textColorTertiary"
@@ -489,7 +489,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/whereaboutsLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -522,7 +522,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/contactLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -554,7 +554,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/scheduleLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -587,7 +587,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/attachAFileLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -619,7 +619,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/attachAnAudioMessageLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -651,7 +651,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/galleryLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -683,7 +683,7 @@
         app:layout_constraintStart_toStartOf="@id/attach"
         app:tint="@android:color/black" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/cameraLabel"
         android:layout_width="wrap_content"
         android:layout_height="32dp"
@@ -894,7 +894,7 @@
             android:layout_marginBottom="12dp"
             android:background="@android:color/black" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/requestText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -907,7 +907,7 @@
             android:layout_height="wrap_content"
             android:orientation="horizontal">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/requestBlock"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -918,7 +918,7 @@
                 android:text="@string/signal_request_block"
                 android:textStyle="bold" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/requestDelete"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -929,7 +929,7 @@
                 android:text="@string/signal_request_delete"
                 android:textStyle="bold" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/requestAccept"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"

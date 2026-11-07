@@ -17,7 +17,7 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/toolbarTitle"
                 style="@style/ToolbarText"
                 android:layout_width="0dp"
@@ -25,7 +25,7 @@
                 android:layout_weight="1"
                 android:textDirection="ltr" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/railBadge"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -64,7 +64,7 @@
         android:paddingBottom="8dp"
         android:visibility="gone">
 
-        <com.wanderwildwood.kotozute.common.widget.QkEditText
+        <de.asdfghasdfgh.kotozute.common.widget.QkEditText
             android:id="@+id/searchField"
             style="@style/TextPrimary"
             android:layout_width="0dp"
@@ -80,7 +80,7 @@
             android:paddingEnd="16dp"
             android:textColorHint="?android:attr/textColorTertiary" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/searchCount"
             style="@style/TextSecondary"
             android:layout_width="wrap_content"
@@ -102,7 +102,7 @@
     </LinearLayout>
 
     <!-- The conversation's pinned messages: the newest, and how many there are. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/pinnedBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -129,14 +129,14 @@
         android:paddingBottom="8dp"
         android:visibility="gone">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/identityNoticeText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textSize="16sp"
             android:textStyle="bold" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/identityNoticeWhat"
             android:layout_width="wrap_content"
             android:layout_height="48dp"
@@ -146,7 +146,7 @@
             android:textSize="16sp"
             android:textStyle="italic" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/identityNoticeExplain"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -199,7 +199,7 @@
 
         <!-- A thread reached from the directory has no messages in it yet. Blank white with
              a composer under it reads as broken; one line reads as new. -->
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/empty"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -217,7 +217,7 @@
          is, and a tap takes it away. Two lines at most; the quote itself goes whole. -->
     <!-- Who is typing. A line of its own rather than a bubble in the list: on e-ink a
          bubble that comes and goes would redraw the conversation each time. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/typing"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -231,7 +231,7 @@
         android:textStyle="italic"
         android:visibility="gone" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/replying"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -245,7 +245,7 @@
         android:textSize="16sp"
         android:visibility="gone" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/pending"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -257,7 +257,7 @@
         android:textSize="16sp"
         android:visibility="gone" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/cannotSend"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -283,7 +283,7 @@
         android:paddingBottom="8dp"
         android:visibility="gone">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/requestText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -295,7 +295,7 @@
             android:layout_height="wrap_content"
             android:orientation="horizontal">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/requestBlock"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -306,7 +306,7 @@
                 android:text="@string/signal_request_block"
                 android:textStyle="bold" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/requestDelete"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -317,7 +317,7 @@
                 android:text="@string/signal_request_delete"
                 android:textStyle="bold" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/requestAccept"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -351,7 +351,7 @@
             android:src="@drawable/ic_add_black_24dp"
             android:tint="@android:color/black" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkEditText
+        <de.asdfghasdfgh.kotozute.common.widget.QkEditText
             android:id="@+id/message"
             style="@style/TextPrimary"
             android:layout_width="0dp"

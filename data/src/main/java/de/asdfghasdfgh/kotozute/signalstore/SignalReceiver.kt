@@ -1,0 +1,2908 @@
+package de.asdfghasdfgh.kotozute.signalstore
+
+import org.signal.core.models.ServiceId
+import org.signal.libsignal.metadata.certificate.CertificateValidator
+import org.signal.libsignal.protocol.SignalProtocolAddress
+import org.whispersystems.signalservice.api.SignalSessionLock
+import org.whispersystems.signalservice.api.crypto.SignalServiceCipher
+import org.whispersystems.signalservice.api.messages.EnvelopeResponse
+import org.whispersystems.signalservice.api.push.SignalServiceAddress
+import org.whispersystems.signalservice.api.push.ServiceIdType
+import org.whispersystems.signalservice.internal.push.Envelope
+import org.whispersystems.signalservice.internal.push.SyncMessage.MessageRequestResponse
+import timber.log.Timber
+import java.util.concurrent.TimeUnit
+
+/**
+ * Takes messages off the socket and decrypts them.
+ *
+ * The receive half of what the bridge used to do. Structured around one rule, which is
+ * signal-cli's and is easy to get backwards:
+ *
+ * > **Write the envelope down before acknowledging it.**
+ *
+ * The server deletes a message the moment it is acked and will not send it again. Ack first
+ * and crash second and the message is not delayed, it is gone -- while the sender's client
+ * shows it delivered. So an envelope is persisted, then acked, and only then decrypted and
+ * filed. A crash after the write costs repeated work; it never costs a message.
+ *
+ * Decryption is deliberately *after* the ack rather than before. It is the step most likely to
+ * fail -- an unknown session, a changed identity, a message from a device we have no session
+ * with -- and holding the queue open behind a message that cannot be decrypted would stop
+ * every message behind it.
+ */
+internal class SignalReceiver(
+    private val db: ProtocolDatabase,
+    private val accounts: SignalAccountStore,
+    private val protocol: SignalDataStore,
+    private val connection: SignalConnection,
+    private val certificateValidator: CertificateValidator,
+    private val attachments: SignalAttachments,
+    private val contacts: SignalContactStore,
+    /** The account's blocked list, kept whole; see [SignalBlockStore]. */
+    private val blocks: SignalBlockStore,
+    /** Where the storage service key ends up; see [SignalKeyStore]. */
+    private val keys: SignalKeyStore,
+    /**
+     * Everything this path has to tell the rest of the app; see [SignalEvents].
+     *
+     * One object rather than the ten lambdas this used to take, because six of them arrived in
+     * one evening and each cost an edit in four files.
+     */
+    private val events: SignalEvents
+) {
+
+    /**
+     * The store's own lock, handed to libsignal as its session lock.
+     *
+     * The same lock, on purpose. libsignal takes this around a decryption and then calls back
+     * into the stores, which take it again -- so a *different* lock here would mean two locks
+     * acquired in a fixed order by one thread and the reverse order by another, which is the
+     * deadlock the single-lock decision was made to avoid. Reentrant, so the callback is free.
+     */
+    private val sessionLock = SignalSessionLock {
+        db.lock.lock()
+        SignalSessionLock.Lock { db.lock.unlock() }
+    }
+
+    data class Received(
+        val envelopes: Int,
+        val decrypted: Int,
+        val failed: Int,
+        val queueEmptied: Boolean,
+        val senders: Set<String>,
+        /** Decrypted *and* something a thread can hold -- receipts and typing are neither. */
+        val stored: Int
+    )
+
+    /**
+     * Drains what the server has, up to [maxBatches] rounds.
+     *
+     * Returns when the server says the queue is empty, which it signals by the read returning
+     * false rather than by any message. That signal is the only way to know a device has
+     * caught up.
+     */
+    fun drain(maxBatches: Int = 20, timeout: Long = TimeUnit.SECONDS.toMillis(20)): Received =
+        drainOnce(timeout, maxBatches)
+
+    private fun drainOnce(timeout: Long, maxBatches: Int = 1): Received {
+        var envelopes = 0
+        var decrypted = 0
+        var failed = 0
+        // Per batch, not per receiver: a rebuilt connection starts a fresh one.
+        identityChangedMidBatch = false
+        /** Whether the server handed out one of this device's one-time keys in this batch. */
+        var usedAPreKey = false
+        repairSelfSessionFor.clear()
+        var emptied = false
+        val senders = mutableSetOf<String>()
+
+        // Before the read, which can wait a full minute on a quiet account: a call nobody hung
+        // up on is settled on the next pass rather than on the next message.
+        settleUnansweredCalls()
+
+        for (round in 1..maxBatches) {
+            val queueNotEmpty = connection.authenticated.readMessageBatch(timeout, BATCH_SIZE) { batch ->
+                batch.forEach { response ->
+                    envelopes++
+                    when (response) {
+                        is EnvelopeResponse.Parsed -> store(response)
+                        // Acked anyway. An envelope the client cannot even parse will never
+                        // become parseable on a retry, and leaving it at the head of the queue
+                        // blocks every message behind it forever.
+                        is EnvelopeResponse.Unparseable ->
+                            Timber.w("signal receive: unparseable envelope; acking to unblock the queue")
+                    }
+                    runCatching { connection.authenticated.sendAck(response) }
+                        .onFailure { Timber.w(it, "signal receive: could not ack; it will be redelivered") }
+                }
+            }
+            if (!queueNotEmpty) {
+                emptied = true
+                break
+            }
+        }
+
+        // Only now, with everything acked and safely on disk.
+        // Whatever an earlier drain decrypted and never filed goes first, in the same
+        // transaction as this batch. Filing is idempotent on the message id, so one that had
+        // in fact reached the message database before the process died is not filed twice.
+        val messages = unfiledStore.all().toMutableList()
+        if (messages.isNotEmpty()) {
+            Timber.w("signal receive: filing %d message(s) decrypted before and never filed", messages.size)
+        }
+        pending().forEach { (id, envelope, serverDeliveredTimestamp, alreadyAsked) ->
+            // Left where it is, to be read by the next batch on the new connection. Signal
+            // breaks the batch at exactly this point and lets the server redeliver the rest;
+            // here the envelopes are already on disk, so leaving the row alone is the same
+            // thing without needing the server to do it again.
+            if (identityChangedMidBatch) return@forEach
+            // The server's own delivery receipt: type SERVER_DELIVERY_RECEIPT, whose content
+            // is empty by definition. It is not a message and there is nothing in it to
+            // decrypt -- it says "what you sent at this timestamp reached them".
+            //
+            // This was being treated as a message that would not decrypt, and kept. Two bugs
+            // in one: a growing pile of envelopes reported to the user as unreadable messages,
+            // and the delivery signal itself discarded -- the very thing deliveredAt exists to
+            // record. It is what "1 message(s) could not be read (unknown)" turned out to be.
+            if (envelope.type == Envelope.Type.SERVER_DELIVERY_RECEIPT) {
+                val from = senderOf(envelope).orEmpty()
+                // clientTimestamp, not the server's: a receipt identifies the message by the
+                // timestamp its *sender* stamped on it, which is the same value stored as the
+                // message's own id and date. The server's timestamp would match nothing.
+                val at = envelope.clientTimestamp ?: 0L
+                // ⚠ **Kept if it could not be recorded.** `delete(id)` below used to run
+                // whichever way this went, so a receipt whose write threw was gone for good and
+                // the message it was about stayed "sent" for ever, with the envelope already
+                // acked to the server and nothing left to redeliver. Upstream's
+                // `IncomingMessageObserver.processReceipt` has **no catch at all** -- a failed
+                // write propagates and the server sends the envelope again -- so not losing it
+                // is upstream's behaviour, reached here by the only route this app has: leave
+                // the row where it is and let the next drain retry it, exactly as a message
+                // whose persist throws is left alone rather than deleted.
+                var recorded = true
+                if (from.isNotBlank() && at > 0) {
+                    runCatching { events.receipts(from, listOf(at), false) }
+                        .onFailure {
+                            recorded = false
+                            Timber.w(it, "signal receive: could not record a delivery receipt; keeping it for the next drain")
+                        }
+                    // The plaintext copy kept for that device is no longer needed: a device
+                    // that has the message will never ask for it again. Signal clears it here
+                    // too (`IncomingMessageObserver.processReceipt` ->
+                    // `messageLog.deleteEntryForRecipient`), keeping the age trim only as a
+                    // backstop rather than as the way entries normally go.
+                    runCatching { SignalMessageLog(db).delivered(from, envelope.sourceDeviceId ?: 0, at) }
+                        .onFailure { Timber.w(it, "signal message log: could not clear a delivered send") }
+                }
+                // The message log is a cleanup and ages out on its own, so its failure is not
+                // a reason to keep the envelope; only the receipt itself is.
+                if (recorded) delete(id)
+                return@forEach
+            }
+
+            // A prekey message is the server handing out one of this device's one-time keys,
+            // so it is the one event that says the pile is shrinking. Noted here and acted on
+            // once the batch is done, because a run of them is still one refill.
+            //
+            // On the envelope's type and before decryption, which is where Signal does it:
+            // `MessageDecryptor` adds a `PreKeysSyncJob` follow-up on
+            // `envelope.type == PREKEY_MESSAGE` whatever the decryption then does.
+            if (envelope.type == Envelope.Type.PREKEY_MESSAGE) usedAPreKey = true
+
+            when (val result = decrypt(envelope, serverDeliveredTimestamp, alreadyAsked)) {
+                // Kept, not deleted. The envelope was acknowledged on the way past -- the
+                // server has forgotten it and will never send it again -- so deleting a row
+                // we failed to decrypt destroys the message permanently. A decryption that
+                // fails today may succeed after a fix, and the ciphertext is the only copy
+                // left anywhere. Swept by age below rather than kept for ever.
+                null -> {
+                    // Kept only when decryption actually threw. A null with nothing recorded
+                    // means there was no content to decrypt, and keeping those is how an
+                    // ordinary event becomes a permanent "message could not be read".
+                    val why = lastFailure
+                    if (why == null) {
+                        delete(id)
+                    } else {
+                        failed++
+                        recordFailure(id, why)
+                        // So the next batch does not ask this person again for the same
+                        // message, and the one after that, for a fortnight.
+                        if (askedForRetry) markAsked(id)
+                    }
+                }
+                else -> {
+                    decrypted++
+                    senders += result.first
+                    val message = result.second
+                    if (message == null) {
+                        delete(id)
+                    } else {
+                        // ⚠ Not a plain delete. The envelope is the last copy of this message
+                        // that can survive the process, and it cannot be decrypted a second
+                        // time, so its place is taken by the decrypted message in the same
+                        // transaction. See [ProtocolStoreSchema.UNFILED].
+                        messages += message
+                        unfiledStore.swap(id, message)
+                    }
+                }
+            }
+        }
+        // Filed in one transaction after the whole batch, not one at a time. The rail
+        // announces what it stored, and a notification per message would be a notification
+        // per message on a device catching up after a day offline.
+        val stored = if (messages.isEmpty()) 0 else events.store(messages)
+        // Only once the message database has them. A store that threw leaves them waiting.
+        if (messages.isNotEmpty()) unfiledStore.filed(messages.map { it.id })
+
+        // Before the sweeps, because it is the only one that reaches the network and the only
+        // one somebody is waiting on: until these are back the server hands every new
+        // correspondent a bundle with no one-time key.
+        if (usedAPreKey) {
+            runCatching {
+                PreKeyUploader(
+                    accounts,
+                    connection,
+                    { SignalPreKeyStore(db, it) },
+                    { SignalSignedPreKeyStore(db, it) },
+                    { SignalKyberPreKeyStore(db, it) }
+                ).refillOneTimeIfShort()
+            }.onFailure {
+                // Not retried here. The pile is topped up on its own cadence by key
+                // maintenance as well, so a failure now is made good on the next run rather
+                // than being worth holding the drain open for.
+                Timber.w(it, "signal keys: could not top up after a prekey message")
+            }
+        }
+
+        // ⚠ Only now, with the batch through. This is as near as this app gets to upstream's
+        // `DecryptionsDrainedConstraint`, which is what `AutomaticSessionResetJob` waits on:
+        // a session is thrown away once, against a settled state, rather than once per envelope
+        // while the envelopes behind it still have to be opened against it.
+        if (repairSelfSessionFor.isNotEmpty()) {
+            val devices = repairSelfSessionFor.toList()
+            repairSelfSessionFor.clear()
+            devices.distinct().forEach { repairSessionWithSelf(it) }
+        }
+
+        // A batch arriving is proof the socket is back, which is what was missing when a
+        // resend first failed. The standing retry lives on the store and also runs from key
+        // maintenance, because this block is skipped when the read simply times out.
+        // Both of these are themselves the retry. Failing leaves every owed row exactly as it
+        // was, so the next batch tries again -- which is why neither failure stops the drain.
+        runCatching { events.retryOwedResends() }
+            .onFailure { Timber.w(it, "signal retry: could not try the owed resends; they stay owed") }
+        runCatching { events.retryOwedReceipts() }
+            .onFailure { Timber.w(it, "signal receipt: could not try the owed receipts; they stay owed") }
+
+        announceGivenUpEnvelopes()
+        sweepUndecryptable()
+        // One place decides what this database stops holding: sent plaintext goes on the same
+        // pass as undecryptable envelopes.
+        runCatching { SignalMessageLog(db).sweep() }
+            // A trim, not a correctness step: nothing is wrong with an entry that outlives its
+            // window by one drain, and the next pass removes it.
+            .onFailure { Timber.w(it, "signal message log: could not sweep; the next drain retries") }
+
+        // Only now, and only for what is actually on disk. A delivery receipt is a claim that
+        // this phone has the message; sending it before filing would make that claim on
+        // behalf of a message that could still be lost.
+        //
+        // Sent for everything received, without asking. Unlike a read receipt this is not a
+        // setting and reveals nothing about the reader -- it is how a sender's message stops
+        // saying nothing at all, and a phone that never sends one leaves everyone writing to
+        // it unsure whether it is even on.
+        if (stored > 0) {
+            messages.asSequence()
+                .filterNot { it.outgoing }
+                .filter { it.senderUuid.isNotBlank() && it.ts > 0 }
+                .groupBy({ it.senderUuid }, { it.ts })
+                .forEach { (sender, timestamps) ->
+                    val distinct = timestamps.distinct()
+                    // Refused counts, not only thrown -- the ordinary failure raises nothing.
+                    val went = runCatching { events.sendDeliveryReceipt(sender, distinct) }
+                        .onFailure { Timber.w(it, "signal receive: sending a delivery receipt threw") }
+                        .getOrDefault(false)
+                    if (!went) {
+                        // Owed, not dropped. Upstream retries this for a day
+                        // (`SendDeliveryReceiptJob`), because otherwise a blip between the
+                        // message landing and the receipt going leaves the sender looking at a
+                        // message that arrived and will never say so.
+                        Timber.w("signal receive: could not send a delivery receipt; will keep trying")
+                        runCatching {
+                            SignalReceiptStore(db)
+                                .owe(sender, distinct, SignalReceiptStore.Kind.DELIVERY)
+                        }
+                            .onFailure { failure ->
+                                // ⚠ The end of the line for this receipt, and deliberately so.
+                                // Getting here means the send failed *and* the store would not
+                                // take the note -- one failure, in the database, wearing two
+                                // faces. There is nothing further to write it to, and taking
+                                // the drain down would cost every message in the batch to save
+                                // a delivery tick. Said loudly instead; the sender sees a
+                                // message that arrived and never says so.
+                                Timber.w(failure, "signal receipt: could not note that one is owed; it is lost")
+                            }
+                    }
+                }
+        }
+
+        // After filing, while the connection is still up: a name learned now is a name the
+        // inbox shows on this pass rather than the next one.
+        if (envelopes > 0) runCatching { events.afterBatch() }.onFailure { Timber.w(it, "signal: after-batch") }
+
+        // ⚠ Thrown rather than returned, and thrown *here* rather than at the break: the
+        // socket is the problem, but everything already decrypted deserves to be filed and
+        // acknowledged first.
+        //
+        // That socket was authenticated as the account this device has just stopped being, so
+        // every envelope read on it from now belongs to somebody who no longer exists.
+        // [listen] treats anything but a timeout as a dead connection and builds a new one,
+        // which is what Signal does explicitly at this point -- `resetNetwork()` then
+        // `startNetwork()`. The envelopes skipped above are still on disk and are read by the
+        // next batch, so nothing depends on the server redelivering them.
+        if (identityChangedMidBatch) {
+            throw IdentityChangedMidBatch()
+        }
+
+        return Received(envelopes, decrypted, failed, emptied, senders, stored)
+    }
+
+    /**
+     * Stays on the socket, handling messages as they arrive, until [keepGoing] says stop.
+     *
+     * The difference from [drain] is only that the connection is held open. `readMessageBatch`
+     * blocks until a message arrives or the timeout elapses, so this loop *is* the persistent
+     * connection -- there is no separate "listen" call to make.
+     *
+     * A long timeout rather than a short one on purpose. Each expiry is a wakeup that does
+     * nothing, and on a phone that is battery spent to learn that nothing happened; the
+     * keepalive in [SignalSocketHealthMonitor] is what actually notices a dead socket, and it
+     * does that on its own schedule regardless of what this timeout is.
+     *
+     * @param onBatch called after each batch is stored, with what was filed.
+     */
+    fun listen(keepGoing: () -> Boolean, onBatch: (Received) -> Unit) {
+        while (keepGoing()) {
+            val result = try {
+                drainOnce(READ_TIMEOUT_MS)
+            } catch (e: java.util.concurrent.TimeoutException) {
+                // Nothing arrived inside the read window, which is the ordinary state of a
+                // quiet account and not a broken socket. The read is the only thing that
+                // ended; the connection is still up and its keepalives are still going.
+                //
+                // Letting this out unwound the whole listen, and the loop above it treated
+                // that as a dead connection and built a new authenticated websocket. On a
+                // phone that is not being messaged every minute, that was a full reconnect
+                // every sixty seconds -- 1,440 a day, each one a handshake on the radio, for
+                // a socket that was never broken. Measured on the device: exactly 60.0s
+                // apart, all day.
+                //
+                // Caught narrowly on purpose. A timeout means "carry on reading"; anything
+                // else still unwinds and still reconnects, which is what should happen when
+                // the socket really has gone.
+                continue
+            }
+            // A batch that produced nothing is the common case -- the timeout expiring with an
+            // empty queue -- and announcing it would wake everything downstream for no reason.
+            if (result.envelopes > 0) onBatch(result)
+        }
+    }
+
+    /**
+     * `INSERT OR REPLACE` on the guid: an ack that is lost in flight means the server sends the
+     * same message again, and that redelivery should replace the row rather than queue a
+     * duplicate.
+     */
+    private fun store(response: EnvelopeResponse.Parsed) = withStoreLock(db) {
+        db.writableDatabase.execSQL(
+            """
+            INSERT INTO envelope (server_guid, serialized, server_delivered_timestamp, stored_timestamp)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(server_guid) DO UPDATE SET serialized = excluded.serialized
+            """.trimIndent(),
+            arrayOf<Any?>(
+                response.envelope.serverGuid,
+                response.envelope.encode(),
+                response.serverDeliveredTimestamp,
+                System.currentTimeMillis()
+            )
+        )
+    }
+
+    /** One stored envelope: its row, the envelope, when the server delivered it, and whether
+     *  its sender has already been asked to send it again. */
+    private data class Stored(
+        val id: Long,
+        val envelope: Envelope,
+        val deliveredAt: Long,
+        val alreadyAsked: Boolean
+    )
+
+    private fun pending(): List<Stored> = withStoreLock(db) {
+        db.readableDatabase.rawQuery(
+            "SELECT _id, serialized, server_delivered_timestamp, retry_requested FROM envelope ORDER BY _id",
+            null
+        ).use { c ->
+            generateSequence {
+                if (c.moveToNext()) {
+                    Stored(
+                        c.getLong(0),
+                        Envelope.ADAPTER.decode(c.getBlob(1)),
+                        c.getLong(2),
+                        c.getInt(3) != 0
+                    )
+                } else {
+                    null
+                }
+            }.toList()
+        }
+    }
+
+    /**
+     * Remembers that this envelope's sender has been asked, and who they were.
+     *
+     * Asked once, however long it stays. The sender is recorded with it because this is the
+     * last point at which anybody knows -- see [lastAskedAbout].
+     */
+    private fun markAsked(id: Long) = withStoreLock(db) {
+        val asked = lastAskedAbout
+        db.writableDatabase.execSQL(
+            "UPDATE envelope SET retry_requested = 1, retry_sender = ?, retry_device = ?, " +
+                "retry_group = ? WHERE _id = ?",
+            arrayOf<Any?>(asked?.sender, asked?.deviceId ?: 0, asked?.groupId, id)
+        )
+    }
+
+    /**
+     * The account's phone-number identity changed part-way through a batch.
+     *
+     * Not an error: it is how this path says the connection has to be rebuilt before anything
+     * else is read. Named rather than reusing an IOException so the log says what happened.
+     */
+    internal class IdentityChangedMidBatch :
+        java.io.IOException("the account's phone-number identity changed mid-batch")
+
+    /** What kind of thing a failed decryption was; see [classify]. */
+    private enum class Failure {
+        /** Not a fault at all. Drop it and say nothing to anyone. */
+        ORDINARY,
+
+        /** A real fault the sender can fix by sending again. */
+        WORTH_RETRYING,
+
+        /** A message this build cannot read however many times it is sent. */
+        UNREADABLE_BY_THIS_BUILD
+    }
+
+    /**
+     * Sorts a decryption failure, as `MessageDecryptor.buildResultForDecryptionFailure` does.
+     *
+     * Its `when` is exclusive and most of what reaches it is ignored rather than reported:
+     * a duplicate the server sent twice, a message from ourselves, a malformed structure, and
+     * anything unrecognised. Only five exceptions are worth a retry receipt.
+     *
+     * Walked up the cause chain like [isDuplicate], because these arrive wrapped.
+     */
+    private fun classify(t: Throwable): Failure {
+        val causes = generateSequence(t) { it.cause }.take(CAUSE_DEPTH).toList()
+
+        // The server resending an envelope whose ack was lost, and libsignal refusing to run
+        // the ratchet backwards -- which is the protocol working. The message is already in
+        // the thread. Upstream: ProtocolDuplicateMessageException -> Ignore.
+        if (isDuplicate(t)) return Failure.ORDINARY
+
+        // Our own message coming back to us. Sealed sender cannot be opened by the account
+        // that sent it, so this is what every sent transcript looks like when it reaches
+        // another of this account's devices -- an event, not a fault. Upstream logs it at
+        // info and ignores it.
+        if (causes.any { it is org.signal.libsignal.metadata.SelfSendException }) {
+            return Failure.ORDINARY
+        }
+
+        // Bytes that were never a message. No amount of asking makes them one.
+        if (causes.any {
+                it is org.signal.libsignal.metadata.InvalidMetadataVersionException ||
+                    it is org.signal.libsignal.metadata.InvalidMetadataMessageException ||
+                    it is org.whispersystems.signalservice.api.InvalidMessageStructureException
+            }
+        ) {
+            return Failure.ORDINARY
+        }
+
+        // Newer than this build, or older than the protocol still speaks. Upstream gives each
+        // its own result, and neither asks for a resend.
+        if (causes.any {
+                it is org.signal.libsignal.metadata.ProtocolInvalidVersionException ||
+                    it is org.signal.libsignal.metadata.ProtocolLegacyMessageException
+            }
+        ) {
+            return Failure.UNREADABLE_BY_THIS_BUILD
+        }
+
+        // The five upstream answers with a retry receipt: a session that is gone, a key that
+        // is wrong, an identity that changed, a message that will not open.
+        if (causes.any {
+                it is org.signal.libsignal.metadata.ProtocolInvalidKeyIdException ||
+                    it is org.signal.libsignal.metadata.ProtocolInvalidKeyException ||
+                    it is org.signal.libsignal.metadata.ProtocolUntrustedIdentityException ||
+                    it is org.signal.libsignal.metadata.ProtocolNoSessionException ||
+                    it is org.signal.libsignal.metadata.ProtocolInvalidMessageException
+            }
+        ) {
+            return Failure.WORTH_RETRYING
+        }
+
+        // ⚠ Anything else. Upstream drops it outright; this keeps it, deliberately -- see the
+        // note at the call site. It is still reported, because an unrecognised failure is the
+        // one worth a human noticing.
+        return Failure.WORTH_RETRYING
+    }
+
+    /**
+     * Whether a data message carries anything a conversation would draw.
+     *
+     * Upstream's `DataMessage.hasRenderableContent`, field for field as
+     * `signal-service/libsignal-service` declares them. It is what separates a **group change** from a message that happens to carry one:
+     * a change with nothing to draw is group state, and a change alongside a body or a picture
+     * is content wearing a change as a hat.
+     *
+     * ⚠ Written out rather than inverted from what this app happens to file, because the two
+     * are not the same question. This app does not render polls, pins or contact cards -- it
+     * describes them -- and treating "we would not draw it" as "there is nothing there" would
+     * let a blocked sender put a poll in front of somebody by attaching a group change to it.
+     */
+    private fun hasRenderableContent(
+        message: org.whispersystems.signalservice.internal.push.DataMessage
+    ): Boolean =
+        message.attachments.isNotEmpty() ||
+            message.body != null ||
+            message.quote != null ||
+            message.contact.isNotEmpty() ||
+            message.preview.isNotEmpty() ||
+            message.bodyRanges.isNotEmpty() ||
+            message.sticker != null ||
+            message.reaction != null ||
+            message.delete != null
+
+    private fun isDuplicate(t: Throwable): Boolean =
+        generateSequence(t) { it.cause }.take(CAUSE_DEPTH).any { cause ->
+            cause is org.signal.libsignal.protocol.DuplicateMessageException ||
+                cause::class.java.simpleName.contains("DuplicateMessage")
+        }
+
+    /**
+     * Tells each conversation about a message that was asked for and never came.
+     *
+     * ⚠ **Nothing said anything.** A message that would not open was kept, its sender was asked
+     * once to send it again, and if they never did -- their phone off, the message deleted,
+     * the session broken at their end too -- the conversation simply had a gap in it. The only
+     * sign anywhere was a count on a settings screen, which says nothing about *who* or *when*
+     * and cannot be acted on. A reader cannot ask about a message they were never told existed.
+     *
+     * Upstream does this on the same timer: `PendingRetryReceiptManager` waits an hour from the
+     * moment the retry receipt was sent and then writes `insertBadDecryptMessage` into the
+     * thread, unless the message has since arrived.
+     *
+     * The note is filed under the message's own identity -- `(sender, sentTimestamp)` -- so a
+     * resend that turns up an hour or a week later **replaces** it rather than sitting beside
+     * it. Upstream needs a `messageExists` check before inserting because its rows are keyed
+     * separately; here the key does that work, and it goes on doing it after the insert, which
+     * upstream's check cannot.
+     */
+    private fun announceGivenUpEnvelopes() {
+        val now = System.currentTimeMillis()
+        val giveUpBefore = now - PLACEHOLDER_AFTER_MS
+        val giveUp = withStoreLock(db) {
+            db.readableDatabase.rawQuery(
+                """
+                SELECT _id, serialized, retry_sender, retry_group FROM envelope
+                WHERE retry_requested = 1
+                  AND retry_sender IS NOT NULL
+                  AND placeholder_at IS NULL
+                  AND stored_timestamp > 0
+                  AND stored_timestamp <= ?
+                ORDER BY _id
+                """.trimIndent(),
+                arrayOf(giveUpBefore.toString())
+            ).use { c ->
+                generateSequence {
+                    if (c.moveToNext()) {
+                        Triple(c.getLong(0), Envelope.ADAPTER.decode(c.getBlob(1)), c.getString(2) to c.getBlob(3))
+                    } else {
+                        null
+                    }
+                }.toList()
+            }
+        }
+        if (giveUp.isEmpty()) return
+
+        giveUp.forEach { (id, envelope, who) ->
+            val (sender, groupId) = who
+            // The sender's own timestamp, not ours: it is half of the pair that identifies the
+            // message everywhere, and the half a resend will arrive carrying.
+            val sentTimestamp = envelope.clientTimestamp ?: return@forEach
+            runCatching { events.undecryptableGaveUp(sender, sentTimestamp, groupId) }
+                .onFailure { Timber.w(it, "signal receive: could not say a message was missed") }
+            withStoreLock(db) {
+                db.writableDatabase.execSQL(
+                    "UPDATE envelope SET placeholder_at = ? WHERE _id = ?",
+                    arrayOf<Any?>(now, id)
+                )
+            }
+        }
+        Timber.w(
+            "signal receive: %d message(s) were asked for and never came; the conversations say so now",
+            giveUp.size
+        )
+    }
+
+    private fun sweepUndecryptable() = withStoreLock(db) {
+        val cutoff = System.currentTimeMillis() - UNDECRYPTABLE_RETENTION_MS
+        db.writableDatabase.execSQL(
+            "DELETE FROM envelope WHERE stored_timestamp < ?", arrayOf<Any?>(cutoff)
+        )
+        // Anything an older build filed as unreadable that was only a redelivery. Left alone
+        // it sits in the connection line for the whole retention window, reporting a problem
+        // that was never one.
+        db.writableDatabase.execSQL(
+            "DELETE FROM envelope WHERE failure LIKE '%DuplicateMessage%'"
+        )
+        db.readableDatabase.rawQuery("SELECT count(*) FROM envelope", null).use { c ->
+            val stuck = if (c.moveToFirst()) c.getInt(0) else 0
+            if (stuck > 0) Timber.w("signal receive: %d envelope(s) still undecrypted", stuck)
+        }
+    }
+
+    private fun recordFailure(id: Long, reason: String) = withStoreLock(db) {
+        db.writableDatabase.execSQL(
+            "UPDATE envelope SET failure = ? WHERE _id = ?", arrayOf<Any?>(reason, id)
+        )
+    }
+
+    private fun delete(id: Long) = withStoreLock(db) {
+        db.writableDatabase.execSQL("DELETE FROM envelope WHERE _id = ?", arrayOf<Any?>(id))
+    }
+
+
+    private val unfiledStore = UnfiledStore(db)
+    private val callStore = SignalCallStore(db)
+
+    private fun handleCall(
+        call: org.whispersystems.signalservice.internal.push.CallMessage,
+        from: String,
+        envelope: Envelope
+    ) {
+        val now = System.currentTimeMillis()
+        call.offer?.let { offer ->
+            val id = offer.id ?: return@let
+            val video = offer.type == org.whispersystems.signalservice.internal.push.CallMessage.Offer.Type.OFFER_VIDEO_CALL
+            val at = envelope.serverTimestamp ?: envelope.clientTimestamp ?: now
+            // An offer that arrives already stale -- the phone was off while it rang -- was
+            // missed before anything here saw it. RingRTC's own rule.
+            if (SignalCalls.expired(at, now)) {
+                settleCall(from, id, at, video, CallOutcome.MISSED)
+            } else {
+                runCatching { callStore.offer(SignalCallStore.Ringing(id, from, video, at)) }
+                    .onFailure { Timber.w(it, "signal calls: could not note a ringing call") }
+            }
+        }
+        call.hangup?.let { hangup ->
+            val id = hangup.id ?: return@let
+            // Only a call this phone saw ring. A hangup for one it never heard of has nothing
+            // to settle, and the wrong peer cannot settle somebody else's call.
+            val ringing = runCatching { callStore.take(id) }.getOrNull() ?: return@let
+            if (ringing.peer != from) return@let
+            settleCall(from, id, ringing.offeredAt, ringing.video, SignalCalls.outcomeOfHangup(hangup.type))
+        }
+    }
+
+    private fun handleCallEvent(event: org.whispersystems.signalservice.internal.push.SyncMessage.CallEvent) {
+        if (SignalCalls.isDelete(event.type, event.event)) {
+            val peer = SignalCalls.aciOf(event.conversationId?.toByteArray()) ?: return
+            val id = event.callId ?: return
+            runCatching { events.callDeleted(peer, id) }
+                .onFailure { Timber.w(it, "signal calls: could not delete a call deleted elsewhere") }
+            return
+        }
+        val outcome = SignalCalls.outcomeOfEvent(event.type, event.direction, event.event) ?: return
+        val peer = SignalCalls.aciOf(event.conversationId?.toByteArray()) ?: return
+        val id = event.callId ?: return
+        runCatching { callStore.take(id) }
+        settleCall(
+            peer, id, event.timestamp ?: System.currentTimeMillis(),
+            event.type == org.whispersystems.signalservice.internal.push.SyncMessage.CallEvent.Type.VIDEO_CALL,
+            outcome
+        )
+    }
+
+    private fun settleCall(peer: String, id: Long, at: Long, video: Boolean, outcome: CallOutcome) {
+        Timber.i("signal calls: a %s call settled as %s", if (video) "video" else "voice", outcome)
+        runCatching { events.call(peer, id, at, video, outcome) }
+            .onFailure { Timber.w(it, "signal calls: could not record a call") }
+    }
+
+    /** Calls whose caller never said they had given up. Run on every pass of the loop. */
+    private fun settleUnansweredCalls() {
+        runCatching { callStore.takeExpired(System.currentTimeMillis()) }.getOrDefault(emptyList())
+            .forEach { settleCall(it.peer, it.callId, it.offeredAt, it.video, CallOutcome.MISSED) }
+    }
+
+    /** Set by [decrypt] when it fails, so the caller can record it against the row. */
+    private var lastFailure: String? = null
+
+    /** Set by [decrypt] when it asked the sender to send it again, so the row can remember. */
+    private var askedForRetry: Boolean = false
+
+    /**
+     * Who the message that would not open was from, set alongside [askedForRetry].
+     *
+     * ⚠ This is the only moment it is knowable. A sealed-sender envelope carries **no source**;
+     * the sender's name lives inside the protocol exception and nowhere else. Not writing it
+     * down here means a message that never arrives can never be attributed to anybody, which is
+     * the difference between a conversation saying "something from Ada could not be read" and
+     * saying nothing at all.
+     */
+    private var lastAskedAbout: Asked? = null
+
+    /** Who a message that would not open was from, and where it belonged. */
+    private data class Asked(val sender: String, val deviceId: Int, val groupId: ByteArray?)
+
+    /**
+     * Set by [decrypt] when an envelope changed the account's phone-number identity.
+     *
+     * Everything after it in the batch would be decrypted against a half-swapped identity on a
+     * socket authenticated as the account this device has just stopped being, so the batch
+     * stops there and the connection is rebuilt.
+     */
+    private var identityChangedMidBatch: Boolean = false
+
+    /**
+     * @return the sender, or null if this envelope could not be decrypted.
+     *
+     * A failure here is logged and swallowed rather than thrown. One undecryptable message --
+     * a device we have no session with, an identity that changed since -- must not stop the
+     * ones behind it, and the envelope is already acked, so there is nothing to retry against
+     * the server anyway.
+     */
+    private fun decrypt(
+        envelope: Envelope,
+        serverDeliveredTimestamp: Long,
+        alreadyAsked: Boolean = true
+    ): Pair<String, de.asdfghasdfgh.kotozute.signal.BridgeMessage?>? {
+        // Both cleared before every attempt. They are how this function reports a failure to
+        // its caller, and left set they report the *previous* envelope's failure: after the
+        // first one, every envelope that decrypts to nothing -- and every duplicate the server
+        // redelivers -- inherited that error string, was counted as failed, and was kept
+        // instead of deleted. One real failure quietly turned every quiet event into another.
+        lastFailure = null
+        askedForRetry = false
+        lastAskedAbout = null
+        val credentials = accounts.credentials()
+        val aci = ServiceId.ACI.parseOrNull(credentials.aci) ?: return null
+
+        // ⚠ Addressed to us, or not read at all. `MessageDecryptor` refuses an envelope whose
+        // destination is neither this account's ACI nor its PNI, and the check earns its place
+        // twice over here: it is the thing that makes the store choice below correct rather
+        // than merely usual. `addressedToPni` asks whether the destination is *a* PNI, not
+        // whether it is *ours* -- so an envelope for somebody else's phone-number identity
+        // would pick this account's PNI store and fail as a decryption error, which reads as a
+        // corrupt message rather than as a misdelivery.
+        //
+        // The server only ever fills this queue with our own messages, so nothing should
+        // reach it. That is the argument for checking, not against.
+        val destination = ServiceId.parseOrNull(
+            envelope.destinationServiceId, envelope.destinationServiceIdBinary
+        )
+        val pni = ServiceId.PNI.parseOrNull(credentials.pni)
+        if (destination != null && destination != aci && destination != pni) {
+            // Not kept: it cannot be decrypted with anything this device holds, so keeping it
+            // for a fortnight in case a fix arrives is keeping it for nothing.
+            Timber.w("signal receive: an envelope addressed to somebody else; ignoring it")
+            return null
+        }
+        // ⚠ A deliberate softening: Signal also refuses an envelope with **no** destination at
+        // all, and this does not -- it carries on with the ACI store, which is what happened
+        // before this check existed. Refusing would be the closer copy, but it would silently
+        // drop real messages if any path ever omits the field, and nothing here has proved it
+        // never does. Revisit with evidence rather than by reasoning.
+
+        // Who the envelope says sent it, before anything is decrypted. Sealed sender leaves
+        // both fields empty, which is the whole point of it -- so "no source" and "sealed" are
+        // the same fact here, and Signal names the variable for the second.
+        val hadSealedSenderSource =
+            envelope.sourceServiceId.isNullOrBlank() &&
+                (envelope.sourceServiceIdBinary?.size ?: 0) == 0
+
+        // ⚠ Sealed sender is never used to write to a phone-number identity. A PNI is what
+        // somebody is addressed by when nothing else about them is known, and sealed sender
+        // requires the sender to hold a profile key they could only have from a real
+        // relationship. An envelope claiming both is malformed.
+        if (pni != null && destination == pni && hadSealedSenderSource) {
+            Timber.w("signal receive: a sealed-sender envelope addressed to our phone-number identity; ignoring it")
+            return null
+        }
+
+        // ⚠ Addressed to the phone-number identity: they know us by number, not by account.
+        // Until they are shown the two are one person, their client keeps a second separate
+        // conversation for us -- the same split this app repairs on its own side, inflicted on
+        // theirs. Marked here, which is exactly where `MessageDecryptor` marks it, and the next
+        // message sent to them carries the proof.
+        if (pni != null && destination == pni) {
+            ServiceId.parseOrNull(envelope.sourceServiceId, envelope.sourceServiceIdBinary)
+                ?.let { from ->
+                    Timber.i("signal receive: a message to our phone-number identity; the sender is owed the proof they are one account")
+                    runCatching { contacts.markNeedsPniSignature(from.toString()) }
+                        .onFailure { Timber.w(it, "signal receive: could not note the owed proof") }
+                }
+        }
+
+        // ⚠ And nothing but a delivery receipt ever comes *from* a PNI. A message does not:
+        // the sender would be addressing us from an identity that cannot hold a session.
+        // Upstream refuses it by type, which is the same test made explicit.
+        val claimedSource = ServiceId.parseOrNull(
+            envelope.sourceServiceId, envelope.sourceServiceIdBinary
+        )
+        if (claimedSource is ServiceId.PNI &&
+            envelope.type != Envelope.Type.SERVER_DELIVERY_RECEIPT
+        ) {
+            Timber.w("signal receive: an envelope from a phone-number identity that is not a receipt; ignoring it")
+            return null
+        }
+
+        val cipher = SignalServiceCipher(
+            SignalServiceAddress(aci, credentials.e164),
+            credentials.deviceId,
+            // The ACI store. A PNI-addressed envelope needs the PNI store instead, and using
+            // the wrong one does not fail cleanly -- it fails as a decryption error, which
+            // looks like a corrupt message.
+            if (addressedToPni(envelope)) protocol.pni() else protocol.aci(),
+            sessionLock,
+            certificateValidator
+        )
+        return try {
+            cipher.decrypt(envelope, serverDeliveredTimestamp)?.let { result ->
+                // Before anything at all is read out of it.
+                //
+                // ⚠ This is the check that says a sync message really came from this account.
+                // Without it any contact who can open a session here could send a `syncMessage`
+                // and be obeyed as though they were the owner's own primary device: forge a
+                // message into a thread as though we had sent it, delete the owner's messages,
+                // rewrite the address book, replace the blocked list, or hand the key store an
+                // account entropy pool of their choosing. Every sync branch below is reachable
+                // from the network, and the framing alone was being trusted to say who sent it.
+                //
+                // The validator is Signal's own -- it ships in the service library this app
+                // already depends on -- and it checks more than the sender: message bounds,
+                // group contexts, attachment shapes, and the rest. Signal runs it in exactly
+                // this position, before any handler sees the content.
+                if (!isWorthReading(envelope, result)) return@let null
+
+                // ⚠ The same rule again, now that the real sender is known rather than
+                // claimed. Sealed sender hides the source in the envelope, so the first check
+                // could only ask what the envelope *said*; this one asks what came out of the
+                // decryption. Upstream does both for that reason.
+                if (result.metadata.sourceServiceId is ServiceId.PNI && hadSealedSenderSource) {
+                    Timber.w("signal receive: sealed sender used for a phone-number identity; ignoring it")
+                    return@let null
+                }
+
+                // Whether the account has blocked whoever sent this, decided once.
+                //
+                // ⚠ Never against ourselves. Signal has no way to block your own account, so
+                // any entry that matches it is wrong by construction -- and the thing that
+                // check silently threw away was every note to self. Not a corner case here:
+                // the household's server alerting sends to this account *as* this account, so
+                // UPS failures, SMART warnings, backup failures and the Kuma bridge were all
+                // arriving and all being dropped before anything was stored, with no Note to
+                // Self conversation and no reason for its absence. Found by sending a plain
+                // note to self as a control after a mention test failed the same way.
+                //
+                // Signal decides this in one place too: `MessageContentProcessor.shouldIgnore`
+                // is a single function whose arms answer for each kind of content, and it runs
+                // before any handler sees the message. It is used below wherever Signal uses
+                // it -- and, notably, *not* on a receipt, which Signal goes on processing from
+                // somebody blocked.
+                val fromSelf = credentials.aci
+                    ?.takeIf { it.isNotBlank() }
+                    ?.equals(result.metadata.sourceServiceId.toString(), ignoreCase = true) == true
+                // ⚠ The number resolved from the recipient row, not only the envelope's.
+                //
+                // The account can hold a block by phone number and nothing else -- that is
+                // what `blocked.blockedE164s` carries -- and this tested the envelope's own
+                // `sourceE164`, which a modern server does not fill. So a block by number
+                // never matched anything: the sender was decrypted, filed, shown, notified,
+                // and answered with a delivery receipt telling them this phone is on and had
+                // received them.
+                //
+                // Signal never has this problem because blocked is a column on the recipient
+                // row, which already unifies the account id, the phone-number identity and the
+                // number; its receive path tests the resolved sender and never the envelope
+                // (`MessageContentProcessor` takes `senderRecipient` and asks that). This
+                // resolves the same way round: the number this device holds for whoever sent
+                // it, falling back to the envelope's when the row has none.
+                val senderServiceId = result.metadata.sourceServiceId.toString()
+                val senderNumber = result.metadata.sourceE164?.takeIf { it.isNotBlank() }
+                    ?: runCatching { contacts.numberFor(senderServiceId) }.getOrNull()
+                val senderBlocked = !fromSelf && blocks.isBlocked(senderServiceId, senderNumber)
+
+                // First, before anything else in this batch is decrypted. A group send
+                // encrypts once to a key the sender distributes separately, and the message
+                // that carries the key can arrive in the same batch as messages that need
+                // it. Handled later -- or not at all, which is what happened here -- every
+                // group message from a sender using sender keys fails to decrypt, and the
+                // failure looks like a broken message rather than a missing key.
+                result.content.senderKeyDistributionMessage?.let { distribution ->
+                    acceptSenderKey(
+                        result.metadata.sourceServiceId.toString(),
+                        result.metadata.sourceDeviceId,
+                        distribution.toByteArray()
+                    )
+                }
+
+                // A receipt is about a message we already have, not a new one, so it is
+                // handled here and never reaches the normalizer -- which would find nothing
+                // in it and drop it silently.
+                result.content.receiptMessage?.let { receipt ->
+                    val timestamps = receipt.timestamp
+                    if (timestamps.isNotEmpty()) {
+                        events.receipts(
+                            result.metadata.sourceServiceId.toString(),
+                            timestamps,
+                            receipt.type == org.whispersystems.signalservice.internal.push.ReceiptMessage.Type.READ
+                        )
+                        // Viewed is its own claim: a view-once picture opened, a voice message
+                        // played. It used to count only as delivered.
+                        if (receipt.type == org.whispersystems.signalservice.internal.push.ReceiptMessage.Type.VIEWED) {
+                            events.viewed(result.metadata.sourceServiceId.toString(), timestamps)
+                        }
+                        // Delivery only. A read receipt says somebody looked at it, which is
+                        // not the same claim -- and Signal clears the log on the delivery arm
+                        // (`ReceiptMessageProcessor.handleDeliveryReceipt` -> `addMslDelete`)
+                        // and nowhere else.
+                        if (receipt.type ==
+                            org.whispersystems.signalservice.internal.push.ReceiptMessage.Type.DELIVERY
+                        ) {
+                            val log = SignalMessageLog(db)
+                            timestamps.forEach { at ->
+                                runCatching {
+                                    log.delivered(
+                                        result.metadata.sourceServiceId.toString(),
+                                        result.metadata.sourceDeviceId,
+                                        at
+                                    )
+                                }.onFailure {
+                                    Timber.w(it, "signal message log: could not clear a delivered send")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Profile keys ride on ordinary messages, from the person whose profile they
+                // open. This is the only route: the contacts sync does not carry them, and
+                // without one a profile fetch returns ciphertext.
+                rememberProfileKey(result.content, result.metadata)
+
+                // A transcript of our own send names the recipient twice: by service id and,
+                // usually, by number. That pairing arrives nowhere else on a linked device --
+                // no contact discovery is done here and an incoming envelope carries no
+                // number -- and it is what lets a Signal conversation be matched to a person
+                // in the phone's own address book instead of showing a raw service id.
+                rememberDestination(result.content)
+
+                // Proof, from the person themselves, that a phone-number identity and an
+                // account id are one person. Discovery hands this phone a PNI and nothing
+                // else, so without this the pairing only ever arrives second-hand, in one of
+                // the account's own storage records.
+                // ⚠ Only from an ACI. The signature proves that an account id and a
+                // phone-number identity belong to the same person, and it is checked against
+                // the *sender's* identity key -- so a PNI source would have it comparing the
+                // wrong pair and either failing honest pairings or accepting nonsense.
+                // Upstream ignores it outright when the source is not an ACI.
+                result.content.pniSignatureMessage?.let { signature ->
+                    if (result.metadata.sourceServiceId is ServiceId.ACI) {
+                        rememberVerifiedPni(signature, result.metadata)
+                    } else {
+                        Timber.w("signal receive: a pni signature from something that is not an account id; ignoring it")
+                    }
+                }
+
+                // A Signal call. It goes to the call machinery, which rings and answers; what
+                // is recorded here as well is how a call settled when this phone could not
+                // take part -- missed, or answered or declined on another device. Signal
+                // ignores calls from somebody blocked, and our own devices never call us.
+                result.content.callMessage?.let { call ->
+                    if (!fromSelf && !senderBlocked) {
+                        handleCall(call, senderServiceId, envelope)
+                        runCatching {
+                            events.callMessage(
+                                call, senderServiceId, result.metadata.sourceDeviceId,
+                                envelope.serverTimestamp ?: 0L, serverDeliveredTimestamp
+                            )
+                        }.onFailure { Timber.w(it, "signal calls: could not hand over a call message") }
+                    }
+                }
+                // Somebody typing. Shown in the conversation while it lasts and never stored:
+                // upstream's `MessageContentProcessor.handleTypingMessage`, which also ignores
+                // our own devices and anybody blocked. A group's typing message names the group
+                // by its identifier, which is what a group's thread key is made from.
+                result.content.typingMessage?.let { typing ->
+                    if (!fromSelf && !senderBlocked) {
+                        val group = typing.groupId?.toByteArray()
+                            ?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
+                        val threadKey = if (group != null) "group:$group" else "direct:$senderServiceId"
+                        val started = typing.action ==
+                            org.whispersystems.signalservice.internal.push.TypingMessage.Action.STARTED
+                        runCatching { events.typing(threadKey, senderServiceId, started) }
+                            .onFailure { Timber.w(it, "signal typing: could not pass on") }
+                    }
+                }
+                // Another of our devices telling us how a call went, which is what stops a call
+                // answered on the other phone reading as missed here.
+                result.content.syncMessage?.callEvent?.let { event ->
+                    if (fromSelf) handleCallEvent(event)
+                }
+                // And what it has done with its call history: cleared, or missed calls seen.
+                result.content.syncMessage?.callLogEvent?.let { log ->
+                    if (fromSelf) {
+                        runCatching {
+                            events.callLog(
+                                log.type, SignalCalls.threadKeyOf(log.conversationId?.toByteArray()),
+                                log.callId, log.timestamp
+                            )
+                        }.onFailure { Timber.w(it, "signal calls: could not apply a call history event") }
+                    }
+                }
+
+                // A contacts sync is not a message and never becomes one -- it is the
+                // primary answering a request, and the only way this device learns anybody's
+                // name. Handled before normalizing, which would find nothing to store in it.
+                result.content.syncMessage?.contacts?.let { handleContactsSync(it) }
+
+                // A message withdrawn for everyone. Before the normalizer, which would find
+                // nothing in it and drop it: a delete carries no body, so treated as a
+                // message it is simply not one.
+                //
+                // The author is the envelope's sender for somebody else's delete, and this
+                // account for a sync of our own. Either way it is the author of the message
+                // being withdrawn, which is what the row is keyed by -- so nobody can reach
+                // anybody else's messages with this.
+                (result.content.dataMessage?.delete
+                    ?: result.content.syncMessage?.sent?.message?.delete)
+                    ?.targetSentTimestamp
+                    ?.let { at ->
+                        val author = if (result.content.syncMessage?.sent?.message?.delete != null) {
+                            credentials.aci.orEmpty()
+                        } else {
+                            result.metadata.sourceServiceId.toString()
+                        }
+                        if (author.isNotBlank()) {
+                            // When the withdrawal was sent, which is what bounds it. The
+                            // server's stamp rather than the sender's: the sender chooses
+                            // theirs, and a gesture bounded by a number its author picks is
+                            // not bounded.
+                            val withdrawnAt = envelope.serverTimestamp
+                                ?: envelope.clientTimestamp
+                                ?: System.currentTimeMillis()
+                            runCatching { events.withdrawn(author, at, withdrawnAt) }
+                                .onFailure { Timber.w(it, "signal delete: could not withdraw") }
+                        }
+                    }
+
+                // A group administrator taking somebody else's message down for everybody.
+                //
+                // ⚠ This was neither filtered nor acted on: the message was stored as a blank
+                // row and the one it named survived, so a removal for everyone left the
+                // message fully readable here with an empty bubble beside it -- the same
+                // failure the ordinary withdrawal path was written to end.
+                //
+                // Unlike an ordinary delete it names its target explicitly, because the person
+                // removing it is not the person who wrote it. Upstream requires the sender to
+                // be an administrator of the group the target is in
+                // (`MessageConstraintsUtil.isValidAdminDeleteReceive` -> `groupRecord.isAdmin`),
+                // and allows the admin threshold plus a day of delivery slack -- which is the
+                // same two days the ordinary withdrawal already uses.
+                result.content.dataMessage?.adminDelete?.let { adminDelete ->
+                    val at = adminDelete.targetSentTimestamp ?: 0L
+                    val target = org.signal.core.models.ServiceId
+                        .parseOrNull(null, adminDelete.targetAuthorAciBinary)
+                        ?.toString()
+                    val group = result.content.dataMessage?.groupV2
+                    val master = group?.masterKey?.toByteArray()
+                    val sender = result.metadata.sourceServiceId.toString()
+                    when {
+                        at <= 0 || target.isNullOrBlank() ->
+                            Timber.w("signal delete: an admin removal naming nothing; ignoring it")
+                        master == null || master.isEmpty() ->
+                            Timber.w("signal delete: an admin removal outside a group; ignoring it")
+                        !isGroupAdmin(master, group.revision ?: 0, sender) ->
+                            Timber.w("signal delete: an admin removal from somebody who is not an admin; ignoring it")
+                        else -> {
+                            val withdrawnAt = envelope.serverTimestamp
+                                ?: envelope.clientTimestamp
+                                ?: System.currentTimeMillis()
+                            runCatching { events.withdrawn(target, at, withdrawnAt) }
+                                .onFailure { Timber.w(it, "signal delete: could not apply an admin removal") }
+                        }
+                    }
+                }
+
+                // What the account has read on another device. Applied here, never answered:
+                // the device that did the reading has already told the sender, and saying so
+                // again would tell them twice.
+                result.content.syncMessage?.read
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { read ->
+                        val pairs = read.mapNotNull { one ->
+                            // Both fields, as everywhere: the string is the old one and a
+                            // modern primary fills only the binary twin. Reading one would
+                            // make every read sync name nobody and quietly do nothing.
+                            val sender = ServiceId.parseOrNull(one.senderAci, one.senderAciBinary)
+                                ?.toString() ?: return@mapNotNull null
+                            val at = one.timestamp ?: return@mapNotNull null
+                            sender to at
+                        }
+                        if (pairs.isNotEmpty()) {
+                            // When the other device read them, which is what dates a
+                            // disappearing message's clock. Signal passes the sync's own
+                            // timestamp here for that reason; the server's is preferred
+                            // because the sender chooses the other one.
+                            val readAt = envelope.serverTimestamp
+                                ?: envelope.clientTimestamp
+                                ?: System.currentTimeMillis()
+                            runCatching { events.readElsewhere(pairs, readAt) }
+                                .onFailure { Timber.w(it, "signal read sync: could not apply") }
+                        }
+                    }
+
+                // A view-once message opened on another device. Nothing of it is kept here, so the
+                // one thing left to change is that it has been seen: Signal marks it viewed
+                // (`SyncMessageProcessor.handleSynchronizeViewOnceOpenMessage`), and here that
+                // is the same as reading it elsewhere.
+                result.content.syncMessage?.viewOnceOpen?.let { open ->
+                    val sender = ServiceId.parseOrNull(open.senderAci, open.senderAciBinary)?.toString()
+                    val at = open.timestamp
+                    if (sender != null && at != null) {
+                        val readAt = envelope.serverTimestamp ?: envelope.clientTimestamp ?: System.currentTimeMillis()
+                        runCatching { events.readElsewhere(listOf(sender to at), readAt) }
+                            .onFailure { Timber.w(it, "signal view-once sync: could not apply") }
+                        // And its picture goes, as it would have gone here.
+                        runCatching { events.viewOnceOpenedElsewhere(sender, at) }
+                            .onFailure { Timber.w(it, "signal view-once sync: could not apply") }
+                    }
+                }
+
+                // What the account has deleted on another device, for itself.
+                result.content.syncMessage?.deleteForMe?.let { deletes ->
+                    val messages = deletes.messageDeletes
+                        .flatMap { it.messages }
+                        .mapNotNull { message ->
+                            val author = ServiceId.parseOrNull(
+                                message.authorServiceId, message.authorServiceIdBinary
+                            )?.toString() ?: return@mapNotNull null
+                            val at = message.sentTimestamp ?: return@mapNotNull null
+                            author to at
+                        }
+
+                    // Groups too, now that the two are shown to agree: upstream reads
+                    // `threadGroupId` with `GroupId.push`, and a group's V2 id is the identifier
+                    // derived from its master key (`GroupId.v2`) -- which is exactly what a group
+                    // thread here is keyed on. Anything not 32 bytes is not a V2 group and is
+                    // left alone.
+                    val threads = deletes.conversationDeletes.mapNotNull { conversation ->
+                        conversation.conversation?.let { id ->
+                            val group = id.threadGroupId
+                            if (group != null && group.size > 0) {
+                                return@mapNotNull if (group.size == 32) {
+                                    "group:" + android.util.Base64.encodeToString(group.toByteArray(), android.util.Base64.NO_WRAP)
+                                } else null
+                            }
+                            ServiceId.parseOrNull(id.threadServiceId, id.threadServiceIdBinary)
+                                ?.toString()?.let { "direct:$it" }
+                        }
+                    }
+
+                    if (messages.isNotEmpty() || threads.isNotEmpty()) {
+                        runCatching { events.deletedElsewhere(messages, threads) }
+                            .onFailure { Timber.w(it, "signal delete sync: could not apply") }
+                    }
+                }
+
+                // A conversation the account deleted from a message request on another
+                // device.
+                //
+                // ⚠ This arrives **nowhere else.** `SyncMessage.deleteForMe` above is the
+                // ordinary "I deleted this" sync, and the message-request flow deliberately
+                // does not emit one: upstream calls `deleteConversation(threadId,
+                // syncThreadDelete = false)` at `SyncMessageProcessor:1235`, because this
+                // message *is* the sync. So a conversation dismissed with Delete on the
+                // primary stayed on this phone for ever, and the person who had decided they
+                // did not want to see it went on seeing it here.
+                //
+                // Only the two arms that delete. The others are already covered, and by a
+                // better route than this one:
+                //  - `ACCEPT` sets profile sharing and clears blocked;
+                //  - `BLOCK`, `BLOCK_AND_SPAM` set blocked;
+                //  both of which live in the account's **storage records**, which this device
+                //  re-reads when the primary sends `fetchLatest` -- so they arrive as state
+                //  rather than as an event, which is the more reliable of the two.
+                //  - `SPAM` reports to the service and changes nothing locally.
+                //
+                // ⚠ Direct conversations only, for the same reason the delete sync above says:
+                // a group's thread key here comes from its master key, and the `groupId` in
+                // this message is not that. Guessing the derivation would either match nothing
+                // or, far worse, empty the wrong conversation.
+                result.content.syncMessage?.messageRequestResponse?.let { response ->
+                    // Accepted on another device: the conversation here stops being a request.
+                    // A group is named by its identifier, which is what its thread key is.
+                    if (response.type == MessageRequestResponse.Type.ACCEPT) {
+                        val aci = ServiceId.parseOrNull(response.threadAci, response.threadAciBinary)
+                        val key = when {
+                            aci != null -> "direct:$aci"
+                            response.groupId?.size == 32 -> "group:" + android.util.Base64.encodeToString(
+                                response.groupId!!.toByteArray(), android.util.Base64.NO_WRAP
+                            )
+                            else -> null
+                        }
+                        key?.let { runCatching { events.requestAccepted(it) } }
+                    }
+                    val deletes = response.type == MessageRequestResponse.Type.DELETE ||
+                        response.type == MessageRequestResponse.Type.BLOCK_AND_DELETE
+                    val aci = ServiceId.parseOrNull(response.threadAci, response.threadAciBinary)
+                    when {
+                        !deletes -> Unit
+                        aci == null ->
+                            Timber.i("signal delete sync: a message request was deleted for a group; not guessing which")
+                        else -> runCatching {
+                            events.deletedElsewhere(emptyList(), listOf("direct:$aci"))
+                        }.onFailure { Timber.w(it, "signal delete sync: could not apply a message request delete") }
+                    }
+                }
+
+                // Somebody telling us they could not read something we sent.
+                //
+                // The message itself cannot be sent again from here -- that needs a record of
+                // the ciphertext this device sent, which it does not keep -- but the session
+                // can be cleared so the *next* thing sent to them is built fresh instead of
+                // failing the same way for ever.
+                //
+                // ⚠ Not from somebody blocked, which it was. This handler sat above the block
+                // check, so a blocked contact could hand this phone a retry receipt and have
+                // it archive the session and *resend them the message* -- real content, on
+                // demand, to the one person the account had said no to. Signal answers this
+                // in `shouldIgnore`: the `decryptionErrorMessage` arm returns
+                // `senderRecipient.isBlocked`, and the gate runs before `handleRetryReceipt`
+                // is reached at all.
+                result.content.decryptionErrorMessage?.let { bytes ->
+                    if (senderBlocked) {
+                        Timber.i("signal receive: ignored a retry receipt from somebody blocked")
+                    } else {
+                        repairSessionFor(
+                            result.metadata.sourceServiceId.toString(),
+                            result.metadata.sourceDeviceId,
+                            bytes.toByteArray()
+                        )
+                    }
+                }
+
+                // What the account has verified about somebody's safety number, decided on
+                // another device. A verification is a thing a person does once, carefully, in
+                // the room; it belongs to the account rather than the device it happened on.
+                result.content.syncMessage?.verified?.let { verified ->
+                    val who = ServiceId.parseOrNull(
+                        verified.destinationAci, verified.destinationAciBinary
+                    )?.toString()
+                    val key = verified.identityKey?.toByteArray()
+                    // ⚠ Never about ourselves. Upstream returns immediately on `recipient
+                    // .isSelf()`: the account cannot verify its own safety number, and acting
+                    // on one would write this device's own identity from a sync message.
+                    val aboutSelf = who != null && who.equals(credentials.aci, ignoreCase = true)
+                    if (aboutSelf) {
+                        Timber.w("signal identity: a verification about this account itself; ignoring it")
+                    } else if (who != null && key != null && key.isNotEmpty()) {
+                        runCatching {
+                            protocol.aciStore().setVerified(
+                                who,
+                                org.signal.libsignal.protocol.IdentityKey(key),
+                                verified.state ==
+                                    org.whispersystems.signalservice.internal.push.Verified.State.VERIFIED
+                            )
+                        }.onFailure { Timber.w(it, "signal identity: could not record a verification") }
+                    }
+                }
+
+                // The account's own phone number has changed, and the primary is handing this
+                // device the identity that goes with it.
+                result.content.syncMessage?.pniChangeNumber?.let { change ->
+                    val before = accounts.credentials().pni
+                    applyNumberChange(envelope, result, change)
+                    // Only if it actually took. Upstream's test is the same shape --
+                    // `pniChangeNumber != null && SignalStore.account.pni != pniAtBatchStart`
+                    // -- because a sync that names the number this device already has is not
+                    // a change and there is nothing to reconnect for.
+                    if (accounts.credentials().pni != before) identityChangedMidBatch = true
+                }
+
+                // "Go and read your records again." The account sends this when its stored
+                // contact list changes, and it is the only notice this device gets: a storage
+                // record carries no timestamp anybody watches and nothing polls it.
+                //
+                // Only STORAGE_MANIFEST is acted on. LOCAL_PROFILE is this account's own
+                // profile, which this app does not publish, and SUBSCRIPTION_STATUS is
+                // donations. Acting on those would mean a round trip for nothing.
+                result.content.syncMessage?.fetchLatest?.type?.let { type ->
+                    if (type == org.whispersystems.signalservice.internal.push.SyncMessage.FetchLatest.Type.STORAGE_MANIFEST) {
+                        runCatching { events.refreshStoredRecords() }
+                            .onFailure { Timber.w(it, "signal storage: could not act on a fetch request") }
+                    }
+                }
+
+                // The account's settings. Sent when they change and on request, so this is
+                // how a device that was asleep catches up with a choice made elsewhere.
+                result.content.syncMessage?.configuration?.let { settings ->
+                    runCatching { events.configuration(settings.readReceipts, settings.typingIndicators) }
+                        .onFailure { Timber.w(it, "signal configuration: could not apply") }
+                }
+
+                // The account's blocked list, which arrives whole and replaces what is held.
+                // Stored rather than acted on: this device does not hide anything on the
+                // strength of it, it keeps it so that blocking somebody from here can send
+                // the list back with one more name on it instead of a list of one.
+                result.content.syncMessage?.blocked?.let { handleBlockedSync(it) }
+
+                // The account's own key material, which arrives only because this device
+                // asked. Derived from and dropped; see SignalKeyStore. The contact list is
+                // read as soon as it lands rather than at the next connection: this is the
+                // moment the phone becomes able to read it at all.
+                result.content.syncMessage?.keys?.let { sent ->
+                    // Said either way, because the two failures look identical from outside
+                    // and need different answers: a primary that never replies is one thing,
+                    // a primary that replies with key material in a shape this build cannot
+                    // read is another -- an older Signal sends a master key where a newer one
+                    // sends the pool, and only the pool is in this protocol version.
+                    val pool = sent.accountEntropyPool
+                    when {
+                        pool.isNullOrBlank() ->
+                            Timber.w("signal keys: the primary answered with no account entropy pool")
+                        keys.store(pool) -> events.onKeysLearned()
+                        else -> Timber.w("signal keys: the pool the primary sent would not derive")
+                    }
+                }
+
+                // What a group change said, in words, for the row the normalizer makes of it.
+                var groupChangeWords: String? = null
+
+                // What revision of a group this message came from. Noted before normalizing,
+                // because the normalizer keeps the master key and drops this.
+                (result.content.dataMessage?.groupV2 ?: result.content.syncMessage?.sent?.message?.groupV2)
+                    ?.let { group ->
+                        val master = group.masterKey?.toByteArray()
+                        val revision = group.revision
+                        if (master != null && master.isNotEmpty() && revision != null) {
+                            runCatching { events.groupChanged(master, revision) }
+                                .onFailure { Timber.w(it, "signal group: could not note a revision") }
+                        }
+                        // What the change was, when the message carries the server's signed
+                        // copy of it -- which every change made by a current client does. Read
+                        // as upstream reads it (`GroupManagerV2.decryptChange`): the signature
+                        // checked against the server and the group's id, since a member could
+                        // otherwise put any words they liked in everybody's conversation.
+                        val signed = group.groupChange?.takeIf { it.size > 0 }
+                        if (master != null && master.isNotEmpty() && signed != null) {
+                            groupChangeWords = describeGroupChange(master, signed.toByteArray(), credentials.aci.orEmpty())
+                        }
+                    }
+
+                // Nothing from somebody the account has blocked.
+                //
+                // The list was being kept and not used: a blocked person's messages were
+                // decrypted, filed, shown and announced -- and then answered with a delivery
+                // receipt, which told the person who had been blocked that the phone was on
+                // and had received them. Blocking is the one feature where doing half of it is
+                // worse than not having it.
+                //
+                // Dropped whole, before anything is stored, which is where Signal drops it.
+                // The envelope is still acked and deleted: it has been dealt with.
+                // By account id, by number, and by group -- the account blocks in all three
+                // ways and only the first was being consulted. A blocked group's messages come
+                // from members who are not themselves blocked, so the per-person check never
+                // sees them at all.
+                val fromGroup = (result.content.dataMessage?.groupV2
+                    ?: result.content.syncMessage?.sent?.message?.groupV2)
+                    ?.masterKey?.toByteArray()
+                    ?.let { runCatching { groupIdFrom(it) }.getOrNull() }
+                // ⚠ **Except a group change, which still applies.** Upstream's rule is
+                // `senderRecipient.isBlocked && !isGv2Update`, and the carve-out is the point:
+                // a blocked person does not get to put anything in front of you, but the
+                // change they made to a group you are both in is not a line, it is a fact.
+                // Dropping it leaves this phone's idea of the group quietly wrong -- still
+                // showing a group it has been removed from, or the name it used to have -- and
+                // nothing would ever say so.
+                //
+                // `isGroupV2Update` is narrow by construction: `hasSignedGroupChange &&
+                // !hasRenderableContent`. A message that carries a change *and* something to
+                // draw is content, and is dropped like any other.
+                val isGroupUpdate = result.content.dataMessage?.let { m ->
+                    m.groupV2?.groupChange != null && !hasRenderableContent(m)
+                } ?: false
+                // The self exemption is why a note to self survives this; it is decided once,
+                // with the rest of the reasoning, where `senderBlocked` is worked out above.
+                if ((senderBlocked && !isGroupUpdate) ||
+                    (!fromSelf && blocks.isGroupBlocked(fromGroup) && !isGroupUpdate)
+                ) {
+                    Timber.i("signal receive: dropped a message from somebody or somewhere blocked")
+                    return@let null
+                }
+                if ((senderBlocked || blocks.isGroupBlocked(fromGroup)) && isGroupUpdate) {
+                    Timber.i("signal receive: keeping a group change from somebody blocked; the group state is still theirs to change")
+                }
+
+                // Somebody outside the group does not get to reach back into it.
+                //
+                // ⚠ Two faults here, and the second is the interesting one.
+                //
+                // The check was a no-op for its whole life: it lived inside
+                // `groupV2?.let { ... }`, so its `return@let` bound to *that* lambda rather
+                // than to the one processing the envelope. The warning was logged, the inner
+                // lambda returned a value nobody reads, and the message was stored exactly as
+                // before. A check whose log line says it dropped something it kept is the
+                // worst way for one to fail.
+                //
+                // And it was the wrong check. It dropped *any* group message from a
+                // non-member, which Signal does not do: `shouldIgnoreDataMessage` has no
+                // membership test at all. Signal applies one only where a message reaches
+                // back and changes something somebody already has -- `handleReaction`,
+                // `handlePollCreate`, `handlePollVote`, `handlePinMessage`,
+                // `handleUnpinMessage` -- and always as `groupRecord != null && !members
+                // .contains(sender)`, so a group this device does not know yet fails open.
+                //
+                // So this is now Signal's rule rather than a broader one of our own: of those
+                // operations this app has reactions, and a reaction from outside the group is
+                // refused. An ordinary message is not, because upstream does not refuse it.
+                // [senderIsInGroup] already fails open when the group cannot be fetched, which
+                // is the same direction as upstream's null check.
+                val groupContext = result.content.dataMessage?.groupV2
+
+                // ⚠ An announcement-only group was enforced on the way out and not on the way
+                // in. The setting was fetched, cached, and consulted only when refusing *our*
+                // send -- so a non-admin's message was normalized, stored and shown here while
+                // every other client in the group discarded it. A broadcast group has exactly
+                // one guarantee, and this phone was the device that broke it: the reader sees
+                // something nobody else saw and can reply to it.
+                //
+                // Upstream refuses it before insertion, in `handleGv2PreProcessing`, and the
+                // test for what counts is `hasDisallowedAnnouncementOnlyContent`: a body, an
+                // attachment, a quote, a preview, body ranges, a sticker or a poll. A reaction
+                // is not on that list and neither is a delete -- a non-admin may still react
+                // in a broadcast group, which is why this is not simply "any message".
+                val announcementRefused = groupContext != null &&
+                    result.content.dataMessage?.let { hasDisallowedAnnouncementContent(it) } == true &&
+                    !mayPostToGroup(
+                        groupContext.masterKey?.toByteArray(),
+                        groupContext.revision ?: 0,
+                        result.metadata.sourceServiceId.toString()
+                    )
+                if (announcementRefused) {
+                    Timber.w("signal receive: dropped a message from a non-admin in an announcement-only group")
+                    return@let null
+                }
+
+                if (groupContext != null && result.content.dataMessage?.reaction != null) {
+                    val master = groupContext.masterKey?.toByteArray()
+                    val sender = result.metadata.sourceServiceId.toString()
+                    if (master != null && master.isNotEmpty() &&
+                        !senderIsInGroup(master, groupContext.revision ?: 0, sender)
+                    ) {
+                        Timber.w("signal receive: dropped a group reaction from somebody not in the group")
+                        return@let null
+                    }
+                }
+
+                // A pin or unpin: not a message of its own, but it changes one and, for a pin,
+                // says so in the conversation. Not from somebody blocked.
+                if (!senderBlocked) {
+                    ContentNormalizer.pinIn(result.content, result.metadata, credentials.aci, credentials.e164)?.let { change ->
+                        runCatching { events.pinChanged(change) }
+                            .onFailure { Timber.w(it, "signal pin: could not apply") }
+                    }
+                }
+
+                // A vote on a poll, or a poll ended: applied to the poll it names.
+                if (!senderBlocked) {
+                    ContentNormalizer.pollActionIn(result.content, result.metadata, credentials.aci, credentials.e164)?.let { action ->
+                        runCatching { events.pollAction(action) }
+                            .onFailure { Timber.w(it, "signal poll: could not apply") }
+                    }
+                }
+
+                // A timer change reaches the conversation even though it is not a message.
+                ContentNormalizer.timerUpdateIn(
+                    result.content, result.metadata, credentials.aci, credentials.e164
+                )?.let { update ->
+                    runCatching { events.timerChanged(update.threadKey, update.seconds, update.version, update.setBy, update.sentAt) }
+                        .onFailure { Timber.w(it, "signal timer: could not record a timer change") }
+                }
+
+                val normalized = ContentNormalizer.normalize(
+                    result.content, result.metadata, credentials.aci, credentials.e164,
+                    nameFor = { aci ->
+                        // Whatever this device knows them as. Nothing is fetched here: a mention
+                        // must not turn one message into a round trip per name.
+                        runCatching { contacts.nameFor(aci) }.getOrNull()
+                    },
+                    // A second edit names the first edit, not the original.
+                    originalOf = { author, at -> runCatching { events.originalSentAt(author, at) }.getOrNull() }
+                )
+                // A group change is a row of its own, "Updated the group." until now: given what
+                // it actually did, and read, as upstream's update rows are -- history, not news.
+                val carrier = result.content.dataMessage ?: result.content.syncMessage?.sent?.message
+                val described = normalized?.let { m ->
+                    if (groupChangeWords != null && carrier?.body.isNullOrEmpty() && carrier?.attachments.isNullOrEmpty()) {
+                        // And kept: an update line is history, which upstream does not
+                        // expire with the messages around it.
+                        m.copy(body = groupChangeWords!!, read = true, expiresInSeconds = 0, expiresAt = 0)
+                    } else m
+                }
+                // Downloaded now, while the CDN still has them. See SignalAttachments: a
+                // pointer is only good for a window, so fetching lazily when a bubble is drawn
+                // fails for exactly the attachments worth keeping.
+                val message = described?.let { withAttachments(it, result.content) }
+                // Without the sender and without the thread key. Both identify a person, the
+                // thread key because it is derived from exactly that -- and this is a release
+                // build with a logging tree planted, so anything here is written down. Who is
+                // talking to this phone is the metadata the rest of this protects; it is not
+                // worth a better debug line. That it decrypted, and whether there was anything
+                // to keep, is what this line was actually for.
+                Timber.i(
+                    "signal receive: decrypted -> %s",
+                    if (message != null) "stored" else "nothing to store"
+                )
+                result.metadata.sourceServiceId.toString() to message
+            }
+        } catch (t: Throwable) {
+            // ⚠ Not every failure is a failure, and they were all being treated as one:
+            // kept for a fortnight as retained ciphertext, counted to the user as a message
+            // that could not be read, and answered with a retry receipt.
+            //
+            // Signal sorts them -- `MessageDecryptor.buildResultForDecryptionFailure` is an
+            // exclusive `when` -- and most of what arrives here is ordinary.
+            when (classify(t)) {
+                // Routine. The envelope is deleted, nothing is counted, nobody is asked.
+                Failure.ORDINARY -> {
+                    Timber.i("signal receive: an envelope with nothing to answer for; dropping it")
+                    return null
+                }
+
+                // Readable one day, perhaps, but never by asking. Signal answers an invalid
+                // version or a legacy message with an error in the conversation and no resend
+                // request -- asking would make the sender send again exactly what this build
+                // already cannot read, and again after that.
+                //
+                // Kept rather than dropped, which is where this app differs on purpose: its
+                // envelopes sit in a table rather than in a queue, so keeping one costs a row
+                // instead of blocking anything, and a build that understands the newer version
+                // can still read it. Upstream drops it for a reason -- "so we don't block the
+                // queue" -- that does not exist here.
+                Failure.UNREADABLE_BY_THIS_BUILD -> {
+                    lastFailure = "${t::class.java.simpleName}: ${t.message?.take(120).orEmpty()}"
+                    Timber.w(t, "signal receive: an envelope this build cannot read; keeping it, asking nobody")
+                    // ⚠ The half of upstream's behaviour the comment above described and this
+                    // did not do. "An error in the conversation and no resend request" is two
+                    // things; only the second was here, so the reader got a silent gap -- the
+                    // same fault `announceGivenUpEnvelopes` exists to fix for the other kind of
+                    // unreadable message, in the one case where no amount of waiting fixes it.
+                    sayItCannotBeShown(envelope, t)
+                    return null
+                }
+
+                Failure.WORTH_RETRYING -> Unit
+            }
+            // Addressed to our phone-number identity: dropped, nobody asked, nothing counted --
+            // `MessageDecryptor.buildResultForDecryptionError` returns `Result.Ignore` for it
+            // before it looks at the sender at all ("Decryption error for message sent to our
+            // PNI! Ignoring."), so no retry receipt and no unreadable-message count.
+            //
+            // A *prekey* message that would not open there still says something: the PNI
+            // bundle on the server is not one this device can answer. Upstream forces a
+            // prekey rotation for exactly that (94fcf2b2f1, `MessageDecryptor.kt:330-335`);
+            // [PreKeyUploader.rotateIfKeysAreWrong] is the same consistency check and the
+            // same interval, so a stream of these costs one rotation an hour, not one each.
+            if (addressedToPni(envelope)) {
+                Timber.w("signal receive: could not decrypt an envelope sent to our phone-number identity; dropping it")
+                if (envelope.type == Envelope.Type.PREKEY_MESSAGE) {
+                    runCatching { events.rotatePreKeys() }
+                        .onFailure { Timber.w(it, "signal receive: could not replace the keys") }
+                }
+                return null
+            }
+            // Recorded against the row, not just logged: on a release build the log goes
+            // nowhere, and "one message could not be read" without a reason is a report
+            // nobody can act on.
+            lastFailure = "${t::class.java.simpleName}: ${t.message?.take(120).orEmpty()}"
+            Timber.w(t, "signal receive: could not decrypt an envelope; keeping it")
+            // Once per envelope, ever. An undecryptable one is kept for a fortnight and
+            // retried on every batch; asking each time would turn one unreadable message into
+            // a fortnight of receipts to that person, each making their client archive its
+            // session and resend, each resend failing the same way.
+            // ⚠ Our own primary is a different case, and it had no answer at all.
+            //
+            // A sync message that will not decrypt cannot be answered with a retry receipt --
+            // there is nobody to ask, the sender is this account -- and [askForItAgain] has
+            // always declined to send one, saying in its comment that this is "a session to
+            // repair". Nothing repaired it. So the ratchet stayed broken, every later sync
+            // failed in exactly the same way, and the device went quietly deaf to its own
+            // account: no contact changes, no blocked list, no read syncs, no transcripts of
+            // what was sent from the other phone -- while the socket looked perfectly healthy.
+            //
+            // Upstream repairs it rather than asking: `AutomaticSessionResetJob`, which
+            // MessageDecryptor enqueues on exactly this branch (`if (sender.isSelf)`).
+            if (senderOf(envelope) == accounts.credentials().aci) {
+                // ⚠ Noted, not done here. Upstream *enqueues* `AutomaticSessionResetJob`, and
+                // that job carries `DecryptionsDrainedConstraint` -- it does not run until the
+                // queue is empty. Doing it inline meant archiving the session while the rest of
+                // this batch, encrypted against that same session, was still waiting to be
+                // decrypted; and the archive was not rate-limited at all, so every failing
+                // envelope from our own device archived it again on the way past. Only the null
+                // message was ever throttled.
+                envelope.sourceDeviceId?.let { repairSelfSessionFor += it }
+            } else if (!alreadyAsked) {
+                askedForRetry = askForItAgain(envelope, t)
+            }
+            null
+        }
+    }
+
+    /**
+     * Keeps the key a sender uses for their group messages.
+     *
+     * A group send is encrypted once, to a key the sender hands out beforehand in an ordinary
+     * one-to-one message. Store it and their group messages open; ignore it and they never do.
+     * The store was already wired into the protocol store -- nothing ever put anything in it.
+     *
+     * Adapted from Signal Android's `MessageDecryptor.handleSenderKeyDistributionMessage`,
+     * including where it sits: before the rest of the batch, not after.
+     */
+    private fun acceptSenderKey(sender: String, deviceId: Int, distribution: ByteArray) {
+        if (sender.isBlank()) return
+        runCatching {
+            val message = org.signal.libsignal.protocol.message.SenderKeyDistributionMessage(distribution)
+            org.whispersystems.signalservice.api.crypto.SignalGroupSessionBuilder(
+                sessionLock,
+                org.signal.libsignal.protocol.groups.GroupSessionBuilder(protocol.aci())
+            ).process(SignalProtocolAddress(sender, deviceId), message)
+            Timber.i("signal group key: kept a sender key for distribution %s", message.distributionId)
+        }.onFailure {
+            // Not fatal to the envelope that carried it: that message is still a message, and
+            // it decrypted. Only this sender's group messages are affected.
+            Timber.w(it, "signal group key: a sender key would not be kept")
+        }
+    }
+
+    /**
+     * A group's id as the blocked list holds it, derived from the master key a message carries.
+     *
+     * The same derivation the thread key uses -- the master key is not the id, and comparing
+     * the wrong one would mean a blocked group that never matches.
+     */
+    /** Decrypts a group change carried on a message, and says what it did. See [GroupChangeLines]. */
+    private fun describeGroupChange(masterKey: ByteArray, signedChange: ByteArray, self: String): String? =
+        runCatching {
+            val params = org.signal.libsignal.zkgroup.groups.GroupSecretParams
+                .deriveFromMasterKey(org.signal.libsignal.zkgroup.groups.GroupMasterKey(masterKey))
+            val change = connection.groupOperations.forGroup(params).decryptChange(
+                org.signal.storageservice.storage.protos.groups.GroupChange.ADAPTER.decode(signedChange),
+                org.whispersystems.signalservice.api.groupsv2.DecryptChangeVerificationMode
+                    .verify(params.publicParams.groupIdentifier)
+            ).orElse(null) ?: return@runCatching null
+            events.describeGroupChange(GroupChangeLines.describe(change, self))
+        }.onFailure { Timber.w(it, "signal group: could not read what a group change was") }.getOrNull()
+
+    private fun groupIdFrom(masterKey: ByteArray): ByteArray? = runCatching {
+        org.signal.libsignal.zkgroup.groups.GroupSecretParams
+            .deriveFromMasterKey(org.signal.libsignal.zkgroup.groups.GroupMasterKey(masterKey))
+            .publicParams
+            .groupIdentifier
+            .serialize()
+    }.getOrNull()
+
+    /**
+     * Group state by master key, with the revision it was read at.
+     *
+     * Was the member list alone. An announcement-only group also needs to say who its
+     * administrators are, and fetching the group twice to answer two questions about the same
+     * message is a round trip for nothing.
+     */
+    private val groupState = mutableMapOf<String, Pair<Int, SignalGroups.Group>>()
+
+    /**
+     * Whether this message is the kind an announcement-only group refuses from a non-admin.
+     *
+     * An exact port of `SignalServiceProtoUtil.hasDisallowedAnnouncementOnlyContent`. The list
+     * is the point: a reaction, a delete and a timer change are **not** on it, so a non-admin
+     * can still react in a broadcast group, which is what upstream allows.
+     */
+    private fun hasDisallowedAnnouncementContent(
+        message: org.whispersystems.signalservice.internal.push.DataMessage
+    ): Boolean = message.body != null ||
+        message.attachments.isNotEmpty() ||
+        message.quote != null ||
+        message.preview.isNotEmpty() ||
+        message.bodyRanges.isNotEmpty() ||
+        message.sticker != null ||
+        message.pollCreate != null
+
+    /**
+     * Whether somebody is an administrator of this group.
+     *
+     * ⚠ Fails **closed**, unlike its neighbours, and deliberately: this one guards a power to
+     * delete other people's messages. Not being able to read the group's state is not evidence
+     * that somebody holds that power, and upstream's own test is
+     * `groupRecord.isAdmin(deleteSender)` against a record it already has.
+     */
+    private fun isGroupAdmin(masterKey: ByteArray, revision: Int, sender: String): Boolean {
+        if (sender.isBlank()) return false
+        val id = android.util.Base64.encodeToString(masterKey, android.util.Base64.NO_WRAP)
+        val known = groupState[id]
+        val group = if (known != null && known.first >= revision) {
+            known.second
+        } else {
+            runCatching { SignalGroups(connection, accounts, contacts).fetch(masterKey) }
+                .onFailure { Timber.w(it, "signal group: could not check who administers it") }
+                .getOrNull()
+                ?.also { groupState[id] = it.revision to it }
+                ?: return false
+        }
+        return sender in group.admins
+    }
+
+    /**
+     * Whether somebody may post to this group at all -- that is, whether it is a broadcast
+     * group they are not an administrator of.
+     *
+     * ⚠ Fails **open**, like [senderIsInGroup] and for the same reason: a group whose state
+     * cannot be read is not evidence that the sender is barred from it, and upstream's own
+     * test is `groupRecord.isPresent && ...`, which is false when there is no record.
+     */
+    private fun mayPostToGroup(masterKey: ByteArray?, revision: Int, sender: String): Boolean {
+        if (masterKey == null || masterKey.isEmpty() || sender.isBlank()) return true
+        val id = android.util.Base64.encodeToString(masterKey, android.util.Base64.NO_WRAP)
+        val known = groupState[id]
+        val group = if (known != null && known.first >= revision) {
+            known.second
+        } else {
+            runCatching { SignalGroups(connection, accounts, contacts).fetch(masterKey) }
+                .onFailure { Timber.w(it, "signal group: could not check who may post; letting it through") }
+                .getOrNull()
+                ?.also { groupState[id] = it.revision to it }
+                ?: return true
+        }
+        return !group.announcementOnly || sender in group.admins
+    }
+
+    /**
+     * Whether somebody is currently in the group they are posting to.
+     *
+     * ⚠ Fails **open**, deliberately. A group whose state cannot be fetched -- no network, a
+     * 403 because we are no longer in it ourselves, a server having a moment -- still delivers
+     * its messages. Getting this wrong in the other direction means silently dropping real
+     * messages from real people, which is worse than the hole it closes and is exactly the
+     * class of failure this whole night has been about. The check only ever rejects somebody
+     * when the group's own state has been read and says they are not in it.
+     */
+    private fun senderIsInGroup(masterKey: ByteArray, revision: Int, sender: String): Boolean {
+        if (sender.isBlank()) return true
+        val id = android.util.Base64.encodeToString(masterKey, android.util.Base64.NO_WRAP)
+        val known = groupState[id]
+        if (known != null && known.first >= revision) return sender in known.second.members
+
+        val group = runCatching { SignalGroups(connection, accounts, contacts).fetch(masterKey) }
+            .onFailure { Timber.w(it, "signal group: could not check membership; letting it through") }
+            .getOrNull() ?: return true
+
+        groupState[id] = group.revision to group
+        return sender in group.members
+    }
+
+    /**
+     * Whether a decrypted envelope is one this device should act on at all.
+     *
+     * Signal's `EnvelopeContentValidator`, run where Signal runs it: after decryption, before
+     * a single field is read. The one that matters most here is its sync-message rule --
+     * a `syncMessage` is only ever legitimate from this account's own devices, and anything
+     * else claiming to be one is somebody impersonating the owner's primary.
+     *
+     * ⚠ An unsupported data message is **not** let through, and used to be, on the reasoning
+     * that it is "not invalid, only newer than this build understands, so the parts that are
+     * understood still land". The parts landing is the danger.
+     * `DataMessage.requiredProtocolVersion` is the sender stating the minimum understanding
+     * needed to render the message *correctly*, and `ProtocolVersion` is `VIEW_ONCE = 2`,
+     * `VIEW_ONCE_VIDEO = 3`, `PAYMENTS = 7`, `POLLS = 8` -- so an older build showing what it
+     * recognises turns a view-once photo into a permanent one **while its sender believes it
+     * disappeared**. A broken promise, not a missing feature.
+     *
+     * Upstream stops: `MessageDecryptor:205` returns `Result.UnsupportedDataMessage` instead of
+     * continuing, and `MessageContentProcessor:435` writes an error row and calls
+     * `markAsUnsupportedProtocolVersion`. This does the same, through
+     * [SignalEvents.unsupportedMessage], so the conversation says something rather than showing
+     * a message wrongly or nothing at all.
+     *
+     * Adapted from `MessageDecryptor.decrypt`.
+     */
+    private fun isWorthReading(
+        envelope: Envelope,
+        result: org.whispersystems.signalservice.api.crypto.SignalServiceCipherResult
+    ): Boolean {
+        val self = org.signal.core.models.ServiceId.ACI.parseOrNull(accounts.credentials().aci)
+            ?: run {
+                // No idea who we are yet, so no way to tell our own sync from a stranger's.
+                // Refusing is the safe direction: the alternative is obeying it.
+                Timber.w("signal receive: no local account id, so nothing can be validated; skipping")
+                return false
+            }
+        // ⚠ The type of the ciphertext that was actually decrypted, not one guessed from the
+        // envelope around it. The validator's first rule is
+        // `envelope.type == PLAINTEXT_CONTENT || ciphertextMessageType == PLAINTEXT_CONTENT_TYPE`,
+        // and the second half of that `||` exists precisely because a sealed envelope's type
+        // is UNIDENTIFIED_SENDER whatever is inside it. Handing it `ciphertextTypeOf(envelope
+        // .type)` mapped every sealed envelope to SENDERKEY_TYPE, so `validatePlaintextContent`
+        // never ran on anything -- and PlaintextContent is the sessionless channel Signal
+        // restricts to error receipts. Sent sealed, it could carry a DataMessage or a
+        // SyncMessage and be processed as an ordinary message.
+        //
+        // ⚠ Not the same question as the one [ciphertextTypeOf] answers below. That maps the
+        // envelope's own type for a retry receipt to quote back, which is what Signal's
+        // `toCiphertextMessageType` does and is right there. The two look alike and are not:
+        // one describes the wrapper, this one describes what came out of it.
+        val validation = runCatching {
+            org.whispersystems.signalservice.api.messages.EnvelopeContentValidator.validate(
+                envelope, result.content, self, result.metadata.ciphertextMessageType
+            )
+        }.getOrElse {
+            Timber.w(it, "signal receive: an envelope could not be validated; skipping")
+            return false
+        }
+        return when (validation) {
+            is org.whispersystems.signalservice.api.messages.EnvelopeContentValidator.Result.Valid -> true
+            is org.whispersystems.signalservice.api.messages.EnvelopeContentValidator.Result.UnsupportedDataMessage -> {
+                Timber.w(
+                    "signal receive: a message needs protocol v%d and this build understands v%d; saying so rather than showing it",
+                    validation.theirVersion,
+                    validation.ourVersion
+                )
+                runCatching {
+                    events.cannotShow(
+                        result.metadata.sourceServiceId.toString(),
+                        envelope.clientTimestamp ?: return@runCatching,
+                        result.metadata.groupId,
+                        CannotShow.NEEDS_NEWER_APP
+                    )
+                }.onFailure { Timber.w(it, "signal receive: could not say a message needs a newer build") }
+                false
+            }
+            is org.whispersystems.signalservice.api.messages.EnvelopeContentValidator.Result.Invalid -> {
+                // ⚠ Says **why**. The reason was being thrown away, so every refusal on this
+                // path read the same -- a body over 2048 bytes, a bad group context and a
+                // malformed attachment were one indistinguishable line. `Invalid` carries
+                // `reason` (and a throwable) precisely so the far end can be told apart, and a
+                // refusal nobody can attribute is the shape this rail keeps finding.
+                Timber.w(
+                    validation.throwable,
+                    "signal receive: refused an envelope that did not validate: %s",
+                    validation.reason
+                )
+                false
+            }
+            else -> {
+                Timber.w("signal receive: refused an envelope for an unrecognised reason")
+                false
+            }
+        }
+    }
+
+    /**
+     * Takes a change of the account's own phone number from the primary.
+     *
+     * When the account's number changes, its **phone-number identity changes with it** -- a
+     * new PNI, a new identity key pair, a new signed prekey, a new registration id. The
+     * primary generates all of it, registers it with the server, and hands it to each linked
+     * device here. A device that ignores this keeps the old PNI and the old identity key, and
+     * every message afterwards addressed to the account's phone-number identity fails to
+     * decrypt, for ever, with nothing to explain it.
+     *
+     * Ported from `SyncMessageProcessor.handleSynchronizePniChangeNumber`, guards included --
+     * each of them is load-bearing:
+     *
+     * - **Only from device 1.** No other linked device may change this account's identity.
+     * - **Newer than the last one applied.** The server redelivers, and an old change arriving
+     *   late would replace live key material with superseded key material. That is what the
+     *   watermark in the account table is for.
+     * - **All fields present and sane**, because a half-applied change leaves this device
+     *   holding a PNI whose identity key it does not have.
+     *
+     * ⚠ `updatedPniBinary` is a **raw sixteen-byte UUID**, not the seventeen-byte service-id
+     * encoding used everywhere else in this file. Parsing it with the usual ServiceId helper
+     * reads it as the wrong kind of thing; the proto contract is different here and Signal
+     * says so in a comment at the same spot.
+     */
+    private fun applyNumberChange(
+        envelope: Envelope,
+        result: org.whispersystems.signalservice.api.crypto.SignalServiceCipherResult,
+        change: org.whispersystems.signalservice.internal.push.SyncMessage.PniChangeNumber
+    ) {
+        val at = envelope.serverTimestamp ?: 0L
+        if (result.metadata.sourceDeviceId != DEFAULT_DEVICE_ID) {
+            Timber.w("signal number change: not from the primary device; ignoring")
+            return
+        }
+        if (accounts.credentials().aci.isNullOrBlank()) {
+            Timber.w("signal number change: this device does not know its own account yet; ignoring")
+            return
+        }
+        val applied = runCatching { accounts.lastPniChangeAt() }.getOrDefault(0L)
+        if (at <= applied) {
+            Timber.w("signal number change: not newer than the one already applied; treating as a replay")
+            return
+        }
+
+        val pni = runCatching {
+            val raw = envelope.updatedPniBinary?.takeIf { it.size == RAW_UUID_BYTES }
+            when {
+                raw != null -> java.nio.ByteBuffer.wrap(raw.toByteArray()).let {
+                    java.util.UUID(it.long, it.long)
+                }.toString()
+                !envelope.updatedPni.isNullOrBlank() ->
+                    java.util.UUID.fromString(envelope.updatedPni).toString()
+                else -> null
+            }
+        }.getOrNull() ?: run {
+            Timber.w("signal number change: no new phone-number identity on the envelope; ignoring")
+            return
+        }
+
+        val identityBytes = change.identityKeyPair?.toByteArray()
+        val signedPreKeyBytes = change.signedPreKey?.toByteArray()
+        val registrationId = change.registrationId ?: 0
+        val newE164 = change.newE164.orEmpty()
+        if (identityBytes == null || signedPreKeyBytes == null || registrationId <= 0 ||
+            !newE164.startsWith("+") || newE164.length < 4
+        ) {
+            Timber.w("signal number change: a required field is missing or unusable; ignoring")
+            return
+        }
+
+        runCatching {
+            val identity = org.signal.libsignal.protocol.IdentityKeyPair(identityBytes)
+            val signedPreKey =
+                org.signal.libsignal.protocol.state.SignedPreKeyRecord(signedPreKeyBytes)
+            val kyber = change.lastResortKyberPreKey?.toByteArray()
+                ?.let { org.signal.libsignal.protocol.state.KyberPreKeyRecord(it) }
+
+            // The identity first, so the stores below are written against the account this
+            // device is about to be.
+            accounts.applyNumberChange(newE164, pni, identity, registrationId, at)
+
+            val pniStore = protocol.pniOrNull()
+            if (pniStore != null) {
+                pniStore.storeSignedPreKey(signedPreKey.id, signedPreKey)
+                accounts.recordActiveSignedPreKey(ProtocolDatabase.ACCOUNT_ID_TYPE_PNI, signedPreKey.id)
+                if (kyber != null) {
+                    pniStore.storeLastResortKyberPreKey(kyber.id, kyber)
+                    accounts.recordActiveLastResortKyberPreKey(
+                        ProtocolDatabase.ACCOUNT_ID_TYPE_PNI, kyber.id
+                    )
+                }
+            }
+            // Registered already: the primary submitted these to the server as part of the
+            // change, so from this device they are live rather than waiting to be uploaded.
+            // ⚠ Every held group credential is now stale. They are issued against this
+            // account's ACI *and* its PNI, and the PNI has just been replaced. Upstream clears
+            // them in the same breath as storing the new identity --
+            // `ChangeNumberRepository.applyLocalNumberChange` calls
+            // `AppDependencies.groupsV2Authorization.clear()` there.
+            SignalGroups.forgetCredentials()
+            Timber.i("signal number change: applied a new number and phone-number identity")
+
+            // ⚠ And replaced at once, which is what was missing. These are keys another
+            // device generated and sent through a sync message, and Signal's comment where it
+            // does the same says exactly why they do not stay: "Rotate the primary-generated
+            // keys as soon as possible so we don't rely on them long-term." It sets
+            // `forcePniSignedPreKeyRotation` and enqueues `PreKeysSyncJob(forceRotationRequested
+            // = true)` right here.
+            //
+            // The periodic path cannot cover this. Its clock is the stored record's own
+            // timestamp, and the record just written is brand new -- so storing the primary's
+            // key resets the clock and leaves it in force for the full interval, which is the
+            // opposite of what applying a number change should mean.
+            // ⚠ Owed before it is attempted, and cleared only by a rotation that happened.
+            // Upstream sets `forcePniSignedPreKeyRotation` here and clears it inside
+            // `PreKeysSyncJob`; the flag is what makes the work survive an attempt that does
+            // not come off.
+            //
+            // It has to, because the old comment here was wrong twice over. `rotateNow`
+            // returns a Result, so a *refused* rotation raised nothing and was logged as
+            // "rotated the phone-number identity's keys: Failed(...)" -- announced as done.
+            // And the consolation on the other branch, that the next periodic pass would come
+            // round for them, is exactly what the paragraph above says cannot happen: that
+            // pass measures the stored key's age, and the key the primary just sent is new.
+            // So a rotation that did not go meant this device kept somebody else's keys for
+            // the phone-number identity indefinitely, which is the one thing Signal's comment
+            // says to avoid.
+            events.pniRotationOwed(true)
+            val rotated = runCatching {
+                PreKeyUploader(
+                    accounts,
+                    connection,
+                    { SignalPreKeyStore(db, it) },
+                    { SignalSignedPreKeyStore(db, it) },
+                    { SignalKyberPreKeyStore(db, it) }
+                ).rotateNow(ServiceIdType.PNI)
+            }.onFailure {
+                Timber.w(it, "signal number change: rotating the new keys threw")
+            }.getOrNull()
+            if (rotated is PreKeyUploader.Result.Uploaded) {
+                events.pniRotationOwed(false)
+                Timber.i("signal number change: rotated the phone-number identity's keys")
+            } else {
+                Timber.w(
+                    "signal number change: the phone-number identity is still on the primary's keys (%s); owed",
+                    rotated ?: "threw"
+                )
+            }
+        }.onFailure {
+            // Deliberately loud. A number change that will not apply leaves this device unable
+            // to read anything sent to the account's phone-number identity, and the only
+            // remedy is a re-link.
+            Timber.e(it, "signal number change: COULD NOT APPLY; this device may need re-linking")
+        }
+    }
+
+    /**
+     * Clears a session somebody says is broken, but only the one they mean.
+     *
+     * The receipt carries the ratchet key of the session that failed. Archiving without
+     * checking it would throw away a session that has since been rebuilt and is working --
+     * turning somebody else's stale complaint into a fresh break here, which is the opposite
+     * of a repair. Signal makes the same check for the same reason.
+     *
+     * A receipt naming one of this account's other devices is not ours to act on.
+     *
+     * Adapted from Signal Android's `MessageContentProcessor.handleIndividualRetryReceipt`,
+     * minus the half that resends: that needs a log of sent ciphertext this app does not keep.
+     */
+    private fun repairSessionFor(sender: String, deviceId: Int, serialized: ByteArray) {
+        // Signal-Android aded3f3eb7: nothing is reset or resent for a sender that is not an
+        // account. Blank was the only case caught before; a malformed id reached the store.
+        if (knownSender(sender) == null) {
+            Timber.w("signal retry: a retry receipt from an unknown sender; leaving it")
+            return
+        }
+        runCatching {
+            val error = org.signal.libsignal.protocol.message.DecryptionErrorMessage(serialized)
+            if (error.deviceId != accounts.credentials().deviceId) {
+                Timber.i("signal retry: a retry receipt for another of this account's devices")
+                return
+            }
+            val ratchetKey = error.ratchetKey.orElse(null) ?: run {
+                // Without it there is no way to tell which session they mean, and archiving
+                // on a guess is how a working conversation gets broken.
+                Timber.w("signal retry: a retry receipt with no ratchet key; leaving the session alone")
+                return
+            }
+            val address = SignalProtocolAddress(sender, deviceId)
+            val store = protocol.aci()
+            val session = store.loadSession(address)
+            if (session != null && session.currentRatchetKeyMatches(ratchetKey)) {
+                store.archiveSession(address)
+                Timber.i("signal retry: archived the session they could not read, so the next send is fresh")
+            } else {
+                Timber.i("signal retry: the session has already moved on; leaving it alone")
+            }
+
+            // And send them the message again. Archiving only fixes the next one; this is the
+            // one they actually asked about, and their client is showing nothing while it
+            // waits for it -- which is what ContentHint.RESENDABLE told them to do.
+            // Refused counts as failed, not only thrown. No session, a server error, somebody
+            // who has left -- those are the ordinary ways this does not happen, and none of
+            // them raises anything.
+            val outcome = runCatching { events.resend(sender, error.timestamp) }
+                .onFailure { Timber.w(it, "signal retry: sending it again threw") }
+                .getOrDefault(SignalEvents.Resend.TRY_AGAIN)
+            if (outcome == SignalEvents.Resend.GIVE_UP) {
+                // The server's answer, not the network's: a rate limit, a proof request,
+                // somebody who has left. Upstream's job ends on these rather than retrying.
+                Timber.w("signal retry: the server refused the resend; not keeping it owed")
+            }
+            if (outcome == SignalEvents.Resend.TRY_AGAIN) {
+                // Noted, not dropped. Upstream answers this with a job that keeps trying for a
+                // day (`ResendMessageJob`: lifespan one day, unlimited attempts), because what
+                // usually fails here is the network rather than the send -- and their client
+                // is sitting on nothing, waiting, because RESENDABLE told it to. The plaintext
+                // is already kept; this is the note that somebody is still owed it.
+                Timber.w("signal retry: could not send the message again; will keep trying")
+                runCatching { SignalMessageLog(db).markResendOwed(sender, error.timestamp) }
+                    .onFailure { failure ->
+                        Timber.w(failure, "signal retry: could not note that a resend is owed")
+                    }
+            }
+        }.onFailure {
+            // ⚠ Their message stays unreadable until they ask again. A retry receipt is the
+            // far end saying it could not decrypt; failing to act on one leaves them waiting,
+            // and nothing here re-drives it. Signal clients re-send the receipt, so the next
+            // one brings us back here -- but the delay is real and belongs in the log rather
+            // than passing as routine.
+            Timber.w(it, "signal retry: could not act on a retry receipt; the next receipt returns here")
+        }
+    }
+
+    /**
+     * Throws away the broken session with our own account and asks for a fresh one.
+     *
+     * Signal's `AutomaticSessionResetJob`, less the parts that do not apply here. It archives
+     * the session for that device, clears what it had shared, and -- no more often than once
+     * an hour -- sends a null message, whose whole purpose is the handshake around it.
+     *
+     * Not the local "chat session refreshed" note upstream also inserts: that goes into the
+     * sender's conversation, and the sender here is this account, so it would file a notice
+     * about the machinery into Note to Self.
+     *
+     * ⚠ The hourly limit is upstream's `automaticSessionResetInterval` default, and it is what
+     * stops a wedged session becoming a null message per envelope per batch. Held in memory
+     * rather than on disk: a restart is itself a reason to try again, and the alternative is a
+     * write on a path that runs while decryption is already failing.
+     */
+    private fun repairSessionWithSelf(deviceId: Int) {
+        val self = accounts.credentials().aci ?: return
+        if (deviceId == accounts.credentials().deviceId) return
+
+        runCatching {
+            protocol.aci().archiveSession(SignalProtocolAddress(self, deviceId))
+            Timber.w("signal session: our own device %d's session would not open; archived it", deviceId)
+        }.onFailure { Timber.w(it, "signal session: could not archive our own device's session") }
+
+        val now = System.currentTimeMillis()
+        if (now < (nextSelfResetAt[deviceId] ?: 0L)) {
+            Timber.i("signal session: a repair was already attempted for device %d recently", deviceId)
+            return
+        }
+        // Held off for the full interval while the attempt is in flight, so a batch of
+        // undecryptable envelopes cannot become a null message each.
+        nextSelfResetAt[deviceId] = now + SELF_SESSION_RESET_INTERVAL_MS
+
+        // ⚠ `runCatching` succeeding means it did not *throw*. sendNullMessage returns a
+        // Result, and a refused send -- no session, a server error -- is a `Result.Failed`
+        // that raises nothing, so this used to log "asked our own account for a fresh
+        // session (Failed(...))" and count it as done.
+        val sent = runCatching {
+            SignalSender(
+                SignalNetworkConfig.configuration(), SignalNetworkConfig.USER_AGENT,
+                accounts, db, protocol, connection, contacts
+            ).sendNullMessage(org.signal.core.models.ServiceId.parseOrThrow(self))
+        }.onFailure {
+            Timber.w(it, "signal session: asking for a fresh session threw")
+        }.getOrNull() is SignalSender.Result.Sent
+
+        // ⚠ And the interval is only earned by a send that happened. It used to be stamped
+        // before the attempt and never revisited, so a null message that did not go bought an
+        // hour of silence anyway -- an hour in which this account's own sync messages went on
+        // failing to decrypt, which is the exact thing this repair exists to end.
+        //
+        // Upstream does not have to choose: `AutomaticSessionResetJob` sets
+        // `automaticSessionResetInterval` and then *enqueues* `NullMessageSendJob`, which is a
+        // day of unlimited attempts and retries on a `PushNetworkException`. With no job queue
+        // the nearest honest thing is to let a failure buy a short wait instead of a long one,
+        // and let the next envelope try again.
+        nextSelfResetAt[deviceId] = nextSelfResetAttempt(sent, now)
+        if (sent) {
+            Timber.i("signal session: asked our own account for a fresh session")
+        } else {
+            Timber.w("signal session: could not ask for a fresh session; will try again shortly")
+        }
+    }
+
+    /**
+     * Puts a marker in the conversation where a message this build cannot decrypt should be.
+     *
+     * ⚠ **The gap this fills was named in a comment and left open.** The branch above said, of
+     * an invalid version or a legacy message, that "Signal answers with an error in the
+     * conversation and no resend request" -- and then did only the second half. The reader got
+     * a silent gap, which is the fault [announceGivenUpEnvelopes] exists to prevent for the
+     * other kind of unreadable message, and worse here: that one may still arrive, and this one
+     * never will. Upstream inserts its row at `MessageContentProcessor:421` and `:428`.
+     *
+     * Two sentences, because the two causes ask for opposite things.
+     * `ProtocolLegacyMessageException` is the *sender's* Signal being too old, and upstream's
+     * own wording tells the reader to ask them to update and resend.
+     * `ProtocolInvalidVersionException` is a ciphertext version this build does not speak, and
+     * names neither end -- which one is wrong is not knowable from here, and guessing it is the
+     * kind of confidently-wrong sentence this app tries not to write.
+     *
+     * Best effort throughout: a missing sender, a missing timestamp or a failed write costs the
+     * marker and nothing else. The envelope is already kept, and the decision not to ask for a
+     * resend was made by the caller.
+     */
+    private fun sayItCannotBeShown(envelope: Envelope, failure: Throwable) {
+        val protocolFailure = generateSequence(failure) { it.cause }
+            .take(CAUSE_DEPTH)
+            .filterIsInstance<org.signal.libsignal.metadata.ProtocolException>()
+            .firstOrNull()
+        // The sender as the exception names them, then as the envelope does. Sealed sender
+        // leaves the envelope's copy empty, and the exception's is filled from the inner
+        // message -- the same order [askForItAgain] uses, for the same reason.
+        val sender = protocolFailure?.sender?.takeIf { it.isNotBlank() }
+            ?: senderOf(envelope)
+            ?: return
+        val sentTimestamp = envelope.clientTimestamp ?: return
+        // Never about our own primary's sync stream: a note in a conversation with ourselves
+        // helps nobody, and the session repair is the actual answer there.
+        if (sender == runCatching { accounts.credentials().aci }.getOrNull()) return
+
+        val reason = if (
+            generateSequence(failure) { it.cause }.take(CAUSE_DEPTH)
+                .any { it is org.signal.libsignal.metadata.ProtocolLegacyMessageException }
+        ) {
+            CannotShow.SENDER_TOO_OLD
+        } else {
+            CannotShow.UNREADABLE_FORM
+        }
+
+        runCatching {
+            events.cannotShow(sender, sentTimestamp, protocolFailure?.groupId?.orElse(null), reason)
+        }.onFailure { Timber.w(it, "signal receive: could not say a message cannot be shown") }
+    }
+
+    /**
+     * Asks the sender to send it again, after a decrypt this phone could not do.
+     *
+     * The envelope is kept either way -- a later fix might read it -- but keeping it is not a
+     * recovery. This is: the receipt names the exact message and shows the session is broken,
+     * and the sender's client resends over a fresh one.
+     *
+     * Only for a real protocol failure. A network error or a bug here is not something the far
+     * end can fix by sending again, and asking would be noise in somebody else's app.
+     *
+     * Shape adapted from Signal Android's `MessageDecryptor.buildSendRetryReceiptJob`,
+     * including which bytes to quote back: a sealed-sender envelope has the original inside
+     * the exception rather than in the envelope, and quoting the wrong one produces a receipt
+     * the sender cannot match to anything.
+     */
+    private fun askForItAgain(envelope: Envelope, failure: Throwable): Boolean {
+        val protocolFailure = generateSequence(failure) { it.cause }
+            .take(CAUSE_DEPTH)
+            .filterIsInstance<org.signal.libsignal.metadata.ProtocolException>()
+            .firstOrNull() ?: return false
+
+        // Signal-Android aded3f3eb7: a sender that does not resolve to an account gets
+        // neither a retry receipt nor anything done to its sessions. Checked here, before the
+        // failure is counted or our prekeys are replaced on its account.
+        val sender = knownSender(protocolFailure.sender)
+            ?: senderOf(envelope)
+            ?: run {
+                Timber.w("signal retry: the sender is unknown; not asking it to resend")
+                return false
+            }
+        // Never at ourselves. A failure against our own primary's sync stream is a session to
+        // repair, not a resend to request, and a receipt aimed at our own account would be
+        // asking a device that cannot answer.
+        if (sender == accounts.credentials().aci) {
+            Timber.w("signal retry: could not read our own account's message; not asking it to resend")
+            return false
+        }
+        val timestamp = envelope.clientTimestamp ?: return false
+
+        val sealed = protocolFailure.unidentifiedSenderMessageContent
+        val original: ByteArray
+        val type: Int
+        if (sealed.isPresent) {
+            original = sealed.get().content
+            type = sealed.get().type
+        } else {
+            original = envelope.content?.toByteArray() ?: return false
+            type = ciphertextTypeOf(envelope.type)
+        }
+
+        val error = runCatching {
+            org.signal.libsignal.protocol.message.DecryptionErrorMessage.forOriginalMessage(
+                original, type, timestamp, protocolFailure.senderDevice
+            )
+        }.getOrElse {
+            Timber.w(it, "signal retry: could not describe the message that would not open")
+            return false
+        }
+        // ⚠ Counted before anything is spent on it. Past ten failures from one person inside
+        // three hours this phone stops asking, exactly as upstream stops
+        // (`MessageDecryptor`, `RemoteConfig.retryReceiptMaxCount`) -- and stopping covers the
+        // prekey rotation below as well as the receipt, because rotating is the expensive end
+        // of the loop.
+        if (!keepAskingAfterFailure(sender, System.currentTimeMillis())) {
+            Timber.w(
+                "signal retry: too many messages from this person have failed lately; " +
+                    "not asking again for now"
+            )
+            return false
+        }
+        // Replace the keys before asking, not after. See [SignalEvents.rotatePreKeys]: a prekey
+        // message that would not open indicts the bundle it was built against, and a resend
+        // against the same bundle fails the same way.
+        val onAPreKey = envelope.type == Envelope.Type.PREKEY_MESSAGE ||
+            protocolFailure.message?.lowercase()?.contains("prekey") == true
+        if (onAPreKey) {
+            Timber.w("signal retry: a prekey message would not open; replacing our keys before asking")
+            runCatching { events.rotatePreKeys() }
+                .onFailure { Timber.w(it, "signal retry: could not replace the keys first") }
+        }
+
+        val groupId = protocolFailure.groupId.orElse(null)
+        return runCatching {
+            events.sendRetryReceipt(sender, error, groupId)
+            // Written down only once the ask actually went. An envelope nobody was asked about
+            // is one the sender does not know to resend, so waiting an hour and then telling
+            // the reader it is missing would be announcing a loss this phone never tried to
+            // prevent.
+            lastAskedAbout = Asked(sender, protocolFailure.senderDevice, groupId)
+            true
+        }.getOrElse {
+            Timber.w(it, "signal retry: could not ask for the message again")
+            false
+        }
+    }
+
+    /**
+     * Associates an account id with a phone-number identity, but only on proof.
+     *
+     * The sender signs their PNI identity key with their ACI identity key; verifying it says
+     * the two keys belong to the same person, which is the one claim worth acting on. An
+     * unverified claim would let anybody assert somebody else's PNI and take over the
+     * conversation held under it -- so a signature that does not check out is dropped, and
+     * loudly enough to find in a log.
+     *
+     * Adapted from Signal Android's `MessageDecryptor.handlePniSignatureMessage`, which is
+     * where the shape of this -- which identity store to ask, and what to do when the PNI
+     * identity is only known for device 1 -- comes from.
+     */
+    private fun rememberVerifiedPni(
+        message: org.whispersystems.signalservice.internal.push.PniSignatureMessage,
+        metadata: org.whispersystems.signalservice.api.crypto.EnvelopeMetadata
+    ) {
+        val pniBytes = message.pni?.toByteArray() ?: return
+        val signature = message.signature?.toByteArray() ?: return
+        val pni = org.signal.core.models.ServiceId.PNI.parseOrNull(pniBytes) ?: return
+        val aci = metadata.sourceServiceId.toString().takeIf { it.isNotBlank() } ?: return
+
+        // Already known, from here or from the account's own records. Verifying again costs
+        // two store reads and a curve operation to reach the same conclusion.
+        if (runCatching { contacts.aciForPni(pni.toString()) }.getOrNull() == aci) return
+
+        val store = protocol.aci()
+        val deviceId = metadata.sourceDeviceId
+        val aciIdentity = runCatching {
+            store.getIdentity(SignalProtocolAddress(aci, deviceId))
+        }.getOrNull() ?: run {
+            Timber.w("signal pni: no identity for the sender, so nothing to check a signature against")
+            return
+        }
+        // The PNI identity may only be on file for the primary device: a session with one of
+        // somebody's other devices does not imply one with their phone-number identity on
+        // that same device.
+        val pniIdentity = runCatching {
+            store.getIdentity(SignalProtocolAddress(pni.toString(), deviceId))
+                ?: store.getIdentity(SignalProtocolAddress(pni.toString(), DEFAULT_DEVICE_ID))
+        }.getOrNull() ?: run {
+            Timber.w("signal pni: no identity on file for the phone-number identity being claimed")
+            return
+        }
+
+        val proven = runCatching { pniIdentity.verifyAlternateIdentity(aciIdentity, signature) }
+            .getOrDefault(false)
+        if (!proven) {
+            // Not an error to recover from -- it is somebody claiming an identity that is not
+            // theirs, or a corrupted message. Either way the pairing is not taken.
+            Timber.w("signal pni: a phone-number identity was claimed with a signature that does not check out")
+            return
+        }
+        runCatching { contacts.pair(pni.toString(), aci) }
+            .onFailure { Timber.w(it, "signal pni: a verified pairing would not keep") }
+        Timber.i("signal pni: a phone-number identity was proved to belong to a known account")
+    }
+
+    /**
+     * Notes the sender's profile key when a message carries one.
+     *
+     * Signal shares these deliberately -- a person's key comes with their messages once they
+     * have chosen to share their profile with you -- so this is not something that can be
+     * asked for. It has to be taken when offered, which means every message, not just the
+     * first: a rotated key arrives the same way and a stale one decrypts nothing.
+     */
+    private fun rememberProfileKey(
+        content: org.whispersystems.signalservice.internal.push.Content,
+        metadata: org.whispersystems.signalservice.api.crypto.EnvelopeMetadata
+    ) {
+        // Either shape. An incoming message carries the sender's key; a sync of our own send
+        // carries ours. In both cases it belongs to whoever the envelope says sent it, so one
+        // attribution is right for both -- and taking only the first shape means never
+        // learning our own profile at all.
+        val key = (content.dataMessage?.profileKey ?: content.syncMessage?.sent?.message?.profileKey)
+            ?.toByteArray()
+            ?.takeIf { it.size == PROFILE_KEY_BYTES }
+            ?: return
+        val aci = metadata.sourceServiceId.toString().takeIf { it.isNotBlank() } ?: return
+        // Deliberately without the account id. This is a Signal client in a release build that
+        // plants a logging tree, so anything written here is written down: who is talking to
+        // this phone is exactly the metadata the rest of the app goes to some length not to
+        // hand anyone, and it should not be in a log to buy a slightly better debug line.
+        Timber.i("signal profile: noted a profile key")
+        contacts.store(listOf(SignalContactStore.Contact(serviceId = aci, profileKey = key)))
+    }
+
+    /**
+     * Notes who one of our own sends went to, when the transcript says it in full.
+     *
+     * Only the pairing, never a name: the number is a fact the account already has, while a
+     * name for it is the reader's own business and comes from their address book.
+     */
+    private fun rememberDestination(
+        content: org.whispersystems.signalservice.internal.push.Content
+    ) {
+        val sent = content.syncMessage?.sent ?: return
+        val aci = ContentNormalizer.destinationServiceIdOf(sent).takeIf { it.isNotBlank() } ?: return
+        val e164 = sent.destinationE164?.takeIf { it.isNotBlank() } ?: return
+        contacts.store(listOf(SignalContactStore.Contact(serviceId = aci, e164 = e164)))
+    }
+
+    /**
+     * Streams the contacts blob and stores what is in it.
+     *
+     * Streamed rather than kept: this is a snapshot that is parsed once and superseded by the
+     * next sync, so writing it to disk would leave the whole address book sitting in a file
+     * for no benefit.
+     */
+    private fun handleBlockedSync(
+        blocked: org.whispersystems.signalservice.internal.push.SyncMessage.Blocked
+    ) {
+        // Newest shape first, older shapes only as a fallback -- `handleSynchronizeBlockedListMessage`,
+        // case for case.
+        //
+        // ⚠ Two things were wrong here and they pull in opposite directions.
+        //
+        // The older lists were being read **as well as** the new ones rather than instead of
+        // them, so a primary that sends both shapes had every entry counted twice. Harmless on
+        // its own, and it hid the second fault.
+        //
+        // And of the two older shapes only `acis` -- the hyphenated strings -- was read.
+        // `acisBinary` beside it, the raw sixteen bytes, was not. That is the same binary-twin
+        // trap that cost two thirds of the address book and every mention, and here it costs
+        // something worse than a name: a primary that sends its block list in that shape has
+        // every block silently ignored, so somebody the account owner deliberately blocked goes
+        // on arriving, is filed, shown, announced, and answered with a delivery receipt.
+        val blockedAcis = when {
+            blocked.blockedAcis.isNotEmpty() -> blocked.blockedAcis.mapNotNull { one ->
+                org.signal.core.models.ServiceId.parseOrNull(one.aciBinary?.toByteArray())
+                    ?.let { SignalBlockStore.Blocked(it.toString(), null, one.timestamp ?: 0L) }
+            }
+            blocked.acisBinary.isNotEmpty() -> blocked.acisBinary.mapNotNull { raw ->
+                org.signal.core.models.ServiceId.parseOrNull(raw.toByteArray())
+                    ?.let { SignalBlockStore.Blocked(it.toString(), null, 0L) }
+            }
+            else -> blocked.acis.map { SignalBlockStore.Blocked(it, null, 0L) }
+        }
+        val blockedNumbers = when {
+            blocked.blockedE164s.isNotEmpty() ->
+                blocked.blockedE164s.mapNotNull { one ->
+                    one.e164?.let { SignalBlockStore.Blocked(null, it, one.timestamp ?: 0L) }
+                }
+            else -> blocked.numbers.map { SignalBlockStore.Blocked(null, it, 0L) }
+        }
+        val individuals = blockedAcis + blockedNumbers
+        val groups = when {
+            blocked.blockedGroups.isNotEmpty() ->
+                blocked.blockedGroups.mapNotNull { it.groupId?.toByteArray() }
+            else -> blocked.groupIds.map { it.toByteArray() }
+        }
+        Timber.i(
+            "signal blocked: a sync named %d account(s), %d number(s), %d group(s)",
+            blockedAcis.size, blockedNumbers.size, groups.size
+        )
+        blocks.store(individuals, groups.distinctBy { it.toList() })
+    }
+
+    private fun handleContactsSync(
+        contactsMessage: org.whispersystems.signalservice.internal.push.SyncMessage.Contacts
+    ) {
+        val pointer = contactsMessage.blob ?: return
+        val parsed = attachments.streamOnce(pointer) { input ->
+            val stream = org.whispersystems.signalservice.api.messages.multidevice
+                .DeviceContactsInputStream(input)
+            val found = mutableListOf<SignalContactStore.Contact>()
+            var avatars = 0
+            var avatarBytes = 0L
+            while (true) {
+                val contact = try {
+                    stream.read() ?: break
+                } catch (e: java.io.IOException) {
+                    // signal-cli skips these rather than abandoning the sync: one malformed
+                    // entry should not cost every name after it in the stream.
+                    if (e.message?.contains("Missing contact address") == true) continue else throw e
+                }
+                // ⚠ The avatar's bytes have to be read even though nothing here keeps one.
+                //
+                // `DeviceContactsInputStream.read()` hands back the avatar as a
+                // `LimitedInputStream` wrapped around the *same* underlying stream, and
+                // consumes none of it itself -- so whoever gets the contact must drain it
+                // before asking for the next one. Signal drains it by using it
+                // (`MultiDeviceContactSyncJob` -> `AvatarHelper.setSyncAvatar`); this app has
+                // no avatars, so it drains it and throws it away. Either way the bytes leave
+                // the stream.
+                //
+                // Skipped, the next `readRawVarint32()` read the first bytes of somebody's
+                // photo as a record length: the first contact with a picture desynced the
+                // framing and every name after it was lost, or the whole sync died on the
+                // IOException that followed. Draining happens before anything that could
+                // `continue`, because a contact we do not keep still has to be stepped over.
+                contact.avatar.orElse(null)?.inputStream?.use { avatar ->
+                    avatars++
+                    val scratch = ByteArray(8192)
+                    while (true) {
+                        val read = avatar.read(scratch)
+                        if (read < 0) break
+                        avatarBytes += read
+                    }
+                }
+
+                val aci = contact.aci.orElse(null)?.toString() ?: continue
+                found += SignalContactStore.Contact(
+                    serviceId = aci,
+                    e164 = contact.e164.orElse(null),
+                    name = contact.name.orElse(null)
+                    // No profile key here. DeviceContact carries aci, e164, name, avatar and
+                    // the expiration timer -- and nothing else. Profile keys travel on
+                    // DataMessage instead, shared by the person themselves; see
+                    // rememberProfileKey().
+                )
+            }
+            // Counted, because otherwise "this sync carried no avatars" and "the drain does
+            // nothing" are the same silence -- and the first is what a primary that is
+            // signal-cli rather than a Signal client produces.
+            if (avatars > 0) {
+                Timber.i("signal contacts: stepped over %d avatar(s), %d byte(s)", avatars, avatarBytes)
+            }
+            found
+        }
+        parsed?.takeIf { it.isNotEmpty() }?.let { contacts.store(it) }
+    }
+
+    /**
+     * Replaces the placeholder attachment metadata with what was actually fetched.
+     *
+     * A pointer that fails to download leaves the row saying an attachment exists but is not
+     * here, rather than dropping it: a message that silently loses its picture reads as if the
+     * sender never sent one.
+     */
+    private fun withAttachments(
+        message: de.asdfghasdfgh.kotozute.signal.BridgeMessage,
+        content: org.whispersystems.signalservice.internal.push.Content
+    ): de.asdfghasdfgh.kotozute.signal.BridgeMessage {
+        // An edit carries its own attachments, and they are the ones to keep -- the row is
+        // about to be rewritten with the edited body, so leaving the original's pointers
+        // behind would pair new text with an old picture.
+        val dataMessage = content.syncMessage?.sent?.message
+            ?: content.dataMessage
+            ?: content.syncMessage?.sent?.editMessage?.dataMessage
+            ?: content.editMessage?.dataMessage
+            ?: return message
+        // A view-once picture is fetched like any other: it has to be here to be opened once.
+        // What keeps the promise is that it can only be read by the viewer, and is gone the
+        // moment it has been -- see `SignalRepository.openViewOnce`.
+        val cards = contactCards(message, dataMessage)
+        if (dataMessage.attachments.isEmpty()) {
+            return if (cards.length() == 0) message else message.copy(attachmentsJson = cards.toString())
+        }
+
+        // ⚠ Bounded, which it was not. Every pointer in the message was downloaded, and each
+        // download is allowed up to the receive ceiling -- so one message claiming five
+        // hundred attachments could ask this phone to fetch and keep more than it has room
+        // for, and would hold the receive loop while it tried. Upstream takes at most
+        // `RemoteConfig.maxAttachmentCount` (`SignalServiceProtoUtil.toPointersWithinLimit`);
+        // the number is copied because this app receives no remote config.
+        //
+        // ⛔ Upstream's other rule there -- if any pointer is a voice note, keep only that one
+        // -- is deliberately not ported. Nothing here reads the voiceNote flag; a voice note is
+        // an attachment like any other, so applying that rule would silently drop real
+        // attachments rather than tidy a presentation this app does not have.
+        val pointers = dataMessage.attachments.take(MAX_ATTACHMENT_COUNT)
+        if (pointers.size < dataMessage.attachments.size) {
+            Timber.w(
+                "signal receive: a message claimed %d attachments; keeping the first %d",
+                dataMessage.attachments.size, pointers.size
+            )
+        }
+
+        val array = org.json.JSONArray()
+        pointers.forEach { pointer ->
+            val id = attachments.download(pointer)
+            val entry = org.json.JSONObject()
+                .put("id", id.orEmpty())
+                .put("type", pointer.contentType.orEmpty())
+                .put("filename", pointer.fileName.orEmpty())
+                .put("size", pointer.size ?: 0)
+                // The same masked read [ContentNormalizer] does, through the same function:
+                // this record and the one written before the download describe the same
+                // message, and a voice note that is one of them and not the other would play
+                // or not depending on which path filed it.
+                .put("voice", ContentNormalizer.isVoiceNote(pointer.flags))
+                .put("gif", ContentNormalizer.isGif(pointer.flags))
+                .put("pending", id == null)
+            // ⚠ **The pointer is kept when the download failed, and only then.** Three
+            // immediate attempts cover a dropped socket; they do not cover a phone with no
+            // usable connection for the length of one batch, which on a device built to sleep
+            // is an ordinary evening. Without the pointer there is nothing left to try again
+            // with, the CDN copy expires in weeks, and the message says "attachment, not
+            // downloaded" for the rest of its life.
+            //
+            // Upstream keeps trying for a full day -- `AttachmentDownloadJob` is
+            // `setLifespan(1 day)` with `setMaxAttempts(UNLIMITED)`, retrying on network
+            // errors. This is the same promise with the pointer carried on the message row
+            // rather than in a job.
+            //
+            // On the row rather than in a table of its own, deliberately: the pointer then
+            // cannot outlive the message it belongs to, which is the whole lesson of the
+            // abandoned-attachment sweep. It holds the CDN key and digest, and Realm here is
+            // encrypted -- the same place the message body already lives.
+            if (id == null) {
+                entry.put("pointer", android.util.Base64.encodeToString(pointer.encode(), android.util.Base64.NO_WRAP))
+                entry.put("firstTried", System.currentTimeMillis())
+            }
+            array.put(entry)
+        }
+        for (i in 0 until cards.length()) array.put(cards.get(i))
+        return message.copy(attachmentsJson = array.toString())
+    }
+
+    /**
+     * A shared contact, kept as a vCard beside the message so that opening it hands it to the
+     * phone's contacts app. Named after the person, so the row says who it is. See
+     * [ContactCards]; upstream shows the same card with an "Add to contacts" button.
+     */
+    private fun contactCards(
+        message: de.asdfghasdfgh.kotozute.signal.BridgeMessage,
+        dataMessage: org.whispersystems.signalservice.internal.push.DataMessage
+    ): org.json.JSONArray {
+        val out = org.json.JSONArray()
+        dataMessage.contact.take(MAX_ATTACHMENT_COUNT).forEachIndexed { i, contact ->
+            val vcard = runCatching { ContactCards.toVCard(contact) }.getOrNull() ?: return@forEachIndexed
+            val bytes = vcard.toByteArray()
+            val id = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("contact:${message.id}:$i".toByteArray())
+                .joinToString("") { "%02x".format(it) }
+                .take(32)
+            if (!attachments.keep(id) { java.io.ByteArrayInputStream(bytes) }) return@forEachIndexed
+            val name = ContactCards.nameOf(contact).ifBlank { "contact" }
+            out.put(
+                org.json.JSONObject()
+                    .put("id", id)
+                    .put("type", "text/x-vcard")
+                    .put("filename", "$name.vcf")
+                    .put("size", bytes.size)
+                    .put("contact", true)
+            )
+        }
+        return out
+    }
+
+    companion object {
+
+        /**
+         * The earliest each of our own devices may have its session thrown away again.
+         *
+         * Was the time of the last *attempt*, which is a different question: an attempt that
+         * did not happen bought the same hour of quiet as one that did. In memory only -- see
+         * [repairSessionWithSelf].
+         */
+        private val nextSelfResetAt = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+
+        /**
+         * Which of our own devices need their session thrown away, once this batch is through.
+         *
+         * Collected rather than acted on, because the envelopes still to be opened in this
+         * batch were encrypted against the very session the repair discards. Upstream expresses
+         * the same ordering as a constraint on the job (`DecryptionsDrainedConstraint`); with no
+         * job queue, the end of the drain is where it goes.
+         */
+        private val repairSelfSessionFor = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
+
+        /**
+         * How many messages one person may fail to send us before this phone stops asking.
+         *
+         * ⚠ **There was no cap.** Every message that would not open made this phone rotate its
+         * prekeys and post a retry receipt, and the answer to a retry receipt is another
+         * message -- which, if the session is genuinely broken rather than momentarily
+         * confused, fails the same way. Two devices can sit in that loop indefinitely, and on
+         * a phone built to stay asleep it is battery and data spent going nowhere.
+         *
+         * Ten, and a count that clears after three hours of quiet from that person: upstream's
+         * `RemoteConfig.retryReceiptMaxCount` and `retryReceiptMaxCountResetAge`, applied in
+         * `MessageDecryptor.buildResultForDecryptionError`. The numbers are copied because this app
+         * receives no remote config; the defaults are upstream's, not a guess.
+         *
+         * ⚠ The cap gates the **prekey rotation too**, not just the receipt. Upstream reaches
+         * its rotation only past this check, which is the half that would have been easy to
+         * miss -- rotating keys is the expensive end of the loop, not the receipt.
+         */
+        private const val RETRY_RECEIPT_MAX_COUNT = 10
+
+        /**
+         * The most attachments this device will take from one message.
+         *
+         * Thirty-two, which is `RemoteConfig.maxAttachmentCount`'s default. Copied rather than
+         * read, because this app receives no remote config -- the number is upstream's.
+         */
+        internal const val MAX_ATTACHMENT_COUNT = 32
+
+        /** Upstream's `retryReceiptMaxCountResetAge`. */
+        private val RETRY_RECEIPT_COUNT_RESET_MS = TimeUnit.HOURS.toMillis(3)
+
+        /**
+         * How many messages from each person have failed lately, and when the last one did.
+         *
+         * On the companion, not the instance. [SignalReceiver] is built fresh for each drain,
+         * so a counter held on the object would reset on every batch and cap nothing -- the
+         * same trap the group credential cache was in.
+         *
+         * In memory only, as upstream's `decryptionErrorCounts` is: a restart forgives
+         * everybody, which is the right direction to be wrong in. Refusing to ask for messages
+         * because of something written down before a reboot would lose real messages to a
+         * guard meant to stop a loop.
+         */
+        private val decryptionErrors =
+            java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
+
+        /**
+         * Counts one failure from [sender] and says whether to keep asking.
+         *
+         * Pure but for the map it keeps, and separated from the receive path so the boundary
+         * can be tested: the tenth failure is still asked about and the eleventh is not, and a
+         * person who goes quiet for three hours starts again from one.
+         */
+        internal fun keepAskingAfterFailure(
+            sender: String,
+            now: Long,
+            counts: MutableMap<String, Pair<Int, Long>> = decryptionErrors
+        ): Boolean {
+            val (previous, lastAt) = counts[sender] ?: (0 to 0L)
+            val carried = if (lastAt > 0 && now - lastAt > RETRY_RECEIPT_COUNT_RESET_MS) 0 else previous
+            val count = carried + 1
+            counts[sender] = count to now
+            return count <= RETRY_RECEIPT_MAX_COUNT
+        }
+
+        /**
+         * How soon to try again after a null message that did not go.
+         *
+         * A minute, which is the receive loop's own read timeout -- so the next attempt lands
+         * on the next thing that happens rather than on a timer of its own. Upstream leaves
+         * this to the job manager's backoff inside `NullMessageSendJob`; there is no job queue
+         * here, so the interval carries it.
+         */
+        private val SELF_SESSION_RESET_RETRY_MS = TimeUnit.MINUTES.toMillis(1)
+
+        /**
+         * When a device's session may next be reset, given whether the last null message went.
+         *
+         * Its own function so both answers can be tested. A success earns the full quiet of
+         * upstream's interval; a failure earns only a short wait, because the session is still
+         * broken and nothing else is going to fix it.
+         */
+        internal fun nextSelfResetAttempt(sent: Boolean, now: Long): Long =
+            now + if (sent) SELF_SESSION_RESET_INTERVAL_MS else SELF_SESSION_RESET_RETRY_MS
+
+        private val SELF_SESSION_RESET_INTERVAL_MS =
+            java.util.concurrent.TimeUnit.HOURS.toMillis(1)
+
+        /**
+         * Thirty, which is what `IncomingMessageObserver` asks for on both of its reads.
+         *
+         * This was ten, which is not wrong so much as slow in the case that matters: a phone
+         * that has been off for a day comes back to a queue, and every round is a request and
+         * a reply. Three times fewer of them is three times less of the catching-up a reader
+         * actually waits through.
+         */
+        private const val BATCH_SIZE = 30
+
+        /** Signal's primary device. A PNI identity is usually only on file for this one. */
+        private const val DEFAULT_DEVICE_ID = 1
+
+        /** A PNI on a change-number envelope is a bare UUID, not a service id. */
+        private const val RAW_UUID_BYTES = 16
+
+        /**
+         * The envelope's own type, in libsignal's numbering, for a retry receipt to quote.
+         *
+         * An exact port of `MessageDecryptor.toCiphertextMessageType`, fallback included.
+         *
+         * ⚠ **Only for a retry receipt.** It describes the wrapper, not what was inside it, so
+         * it is the wrong answer for anything that asks what was actually decrypted -- the
+         * content validator among them, which used to be given this and so never saw a
+         * sealed PlaintextContent for what it was.
+         */
+        internal fun ciphertextTypeOf(type: Envelope.Type?): Int = when (type) {
+            Envelope.Type.DOUBLE_RATCHET ->
+                org.signal.libsignal.protocol.message.CiphertextMessage.WHISPER_TYPE
+            Envelope.Type.PREKEY_MESSAGE ->
+                org.signal.libsignal.protocol.message.CiphertextMessage.PREKEY_TYPE
+            Envelope.Type.UNIDENTIFIED_SENDER ->
+                org.signal.libsignal.protocol.message.CiphertextMessage.SENDERKEY_TYPE
+            Envelope.Type.PLAINTEXT_CONTENT ->
+                org.signal.libsignal.protocol.message.CiphertextMessage.PLAINTEXT_CONTENT_TYPE
+            else ->
+                org.signal.libsignal.protocol.message.CiphertextMessage.WHISPER_TYPE
+        }
+
+        /**
+         * Who an envelope came from, from whichever field the server filled.
+         *
+         * `sourceServiceId` is the old string and `sourceServiceIdBinary` the raw bytes, and
+         * a modern server sends only the second. Read as a string alone this came back blank,
+         * and a blank sender meant the delivery receipt above was dropped -- which is the very
+         * failure the comment there says this code exists to end. See
+         * [[SignalStorageService.aciOf]] for the same trap in the contact list.
+         */
+        /**
+         * The sender's id when it names an account, else null: upstream's `isUnknown`. The
+         * string a libsignal failure carries is not checked by anything before it gets here.
+         */
+        internal fun knownSender(raw: String?): String? =
+            raw?.takeIf { it.isNotBlank() }?.let { ServiceId.parseOrNull(it, false) }?.toString()
+
+        internal fun senderOf(envelope: Envelope): String? =
+            ServiceId.parseOrNull(envelope.sourceServiceId, envelope.sourceServiceIdBinary)
+                ?.toString()
+
+        /**
+         * Whether an envelope was addressed to this account's PNI rather than its ACI.
+         *
+         * Decided on the parsed id rather than on `startsWith("PNI:")`, because the string it
+         * was testing is empty on a modern server -- so every PNI-addressed envelope was
+         * decrypted against the ACI store. As the comment at the call site says, that does not
+         * fail cleanly: it fails as a decryption error and reads as a corrupt message.
+         */
+        internal fun addressedToPni(envelope: Envelope): Boolean =
+            ServiceId.parseOrNull(
+                envelope.destinationServiceId, envelope.destinationServiceIdBinary
+            ) is ServiceId.PNI
+
+        /** A profile key is exactly this; anything else is not one. */
+        private const val PROFILE_KEY_BYTES = 32
+
+        /**
+         * How long to wait for a resend before telling the reader it never came.
+         *
+         * An hour, which is `PendingRetryReceiptManager.RETRY_RECEIPT_LIFESPAN`. Long enough
+         * that a phone which was merely asleep has woken, short enough that the gap is still
+         * part of a conversation somebody remembers having.
+         */
+        private val PLACEHOLDER_AFTER_MS = TimeUnit.HOURS.toMillis(1)
+
+        /**
+         * Whether enough time has passed to say a message is not coming.
+         *
+         * Its own function because the whole feature is a timer, and a timer is the one thing
+         * that cannot be checked by looking at it: too short and the note appears while the
+         * resend is still in flight, contradicted a minute later by the message itself; too
+         * long and nobody is told until the conversation has moved on.
+         *
+         * A stored time in the future -- a clock that moved -- is not "ready". Waiting costs
+         * the reader nothing they did not already have; announcing a loss that has not happened
+         * costs them a message they would then go and ask about for no reason.
+         */
+        internal fun readyToGiveUp(storedAt: Long, now: Long): Boolean =
+            storedAt in 1..now && now - storedAt >= PLACEHOLDER_AFTER_MS
+
+        /** How long to keep an envelope that will not decrypt, in case a fix arrives. */
+        private val UNDECRYPTABLE_RETENTION_MS = TimeUnit.DAYS.toMillis(14)
+
+        /** How far down a wrapped exception to look. Deep enough for the wrapping libsignal does. */
+        private const val CAUSE_DEPTH = 5
+
+        /** Long, deliberately: every expiry is a wakeup that learned nothing. See [listen]. */
+        private val READ_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(1)
+    }
+}
