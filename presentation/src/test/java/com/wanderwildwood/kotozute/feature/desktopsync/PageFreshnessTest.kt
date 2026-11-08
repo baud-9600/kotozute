@@ -15,7 +15,7 @@ import java.io.File
 class PageFreshnessTest {
 
     private val page = File("src/main/assets/desktopsync/app.js").readText()
-    private val server = File("src/main/java/com/wanderwildwood/kotozute/feature/desktopsync/DesktopSyncServer.kt").readText()
+    private val server = File("src/main/java/de/asdfghasdfgh/kotozute/feature/desktopsync/DesktopSyncServer.kt").readText()
 
     @Test
     fun `the phone says it is there more often than the page gives up on it`() {
