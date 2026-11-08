@@ -108,10 +108,16 @@ object SignalNetworkConfig {
      * classpath the way signal-cli does it, which works on Android because AGP packages
      * `src/main/resources` into the APK -- and which means this needs no Context, so the
      * configuration stays a plain object.
+     *
+     * ⚠ The name is **relative** on purpose. `getResourceAsStream("whisper.store")` resolves
+     * against this class's package, so the file sits beside it in `src/main/resources`. An
+     * absolute path spelled out here is what broke sending when the app's package moved: the
+     * resource moved with it, the string did not, and every send threw "whisper.store is
+     * missing from the APK" while the file was in the APK all along.
      */
     private val trustStore = object : TrustStore {
         override fun getKeyStoreInputStream(): InputStream =
-            requireNotNull(SignalNetworkConfig::class.java.getResourceAsStream("/com/wanderwildwood/kotozute/signalnet/whisper.store")) {
+            requireNotNull(SignalNetworkConfig::class.java.getResourceAsStream("whisper.store")) {
                 "whisper.store is missing from the APK"
             }
 

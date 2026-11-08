@@ -272,7 +272,7 @@ class DesktopSyncSecurityTest {
 
     @Test
     fun `the service is sticky and only the user's stop turns the switch off`() {
-        val source = File("src/main/java/com/wanderwildwood/kotozute/feature/desktopsync/DesktopSyncService.kt").readText()
+        val source = File("src/main/java/de/asdfghasdfgh/kotozute/feature/desktopsync/DesktopSyncService.kt").readText()
         assertTrue(source.contains("return START_STICKY"))
         assertFalse(source.contains("START_NOT_STICKY"))
         fun body(name: String): String {
