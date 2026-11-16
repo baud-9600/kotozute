@@ -23,7 +23,7 @@
     android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context="com.wanderwildwood.kotozute.feature.gallery.GalleryActivity">
+    tools:context="de.asdfghasdfgh.kotozute.feature.gallery.GalleryActivity">
 
     <androidx.viewpager2.widget.ViewPager2
         android:id="@+id/pager"
@@ -45,7 +45,7 @@
             android:gravity="center_vertical"
             android:orientation="vertical">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/toolbarTitle"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -57,7 +57,7 @@
                 app:textSize="toolbar"
                 tools:text="Conversations" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/toolbarSubtitle"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

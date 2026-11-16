@@ -27,7 +27,7 @@
     android:paddingBottom="4dp"
     app:layout_constraintVertical_chainStyle="packed">
 
-    <com.wanderwildwood.kotozute.common.widget.GroupAvatarView
+    <de.asdfghasdfgh.kotozute.common.widget.GroupAvatarView
         android:id="@+id/avatars"
         android:visibility="gone"
         android:layout_width="56dp"
@@ -38,7 +38,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/title"
         style="@style/TextPrimary"
         android:layout_width="0dp"
@@ -56,7 +56,7 @@
         tools:text="@tools:sample/full_names"
         android:textDirection="ltr" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/date"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -69,7 +69,7 @@
         app:textSize="tertiary"
         tools:text="Oct 5" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/blocker"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -82,7 +82,7 @@
         app:textSize="secondary"
         tools:text="Call Control" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/reason"
         android:layout_width="0dp"
         android:layout_height="wrap_content"

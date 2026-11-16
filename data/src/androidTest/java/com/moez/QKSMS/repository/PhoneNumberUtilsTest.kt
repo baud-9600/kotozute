@@ -16,11 +16,11 @@
  * You should have received a copy of the GNU General Public License
  * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
  */
-package com.wanderwildwood.kotozute.repository
+package de.asdfghasdfgh.kotozute.repository
 
 import androidx.test.InstrumentationRegistry
 import androidx.test.runner.AndroidJUnit4
-import com.wanderwildwood.kotozute.util.PhoneNumberUtils
+import de.asdfghasdfgh.kotozute.util.PhoneNumberUtils
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before

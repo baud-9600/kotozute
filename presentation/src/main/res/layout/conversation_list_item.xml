@@ -32,7 +32,7 @@
     android:paddingBottom="8dp"
     android:nextFocusRight="@+id/compose">
 
-    <com.wanderwildwood.kotozute.common.widget.GroupAvatarView
+    <de.asdfghasdfgh.kotozute.common.widget.GroupAvatarView
         android:id="@+id/avatars"
         android:layout_width="56dp"
         android:layout_height="56dp"
@@ -43,7 +43,7 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintVertical_bias="0" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/title"
         style="@style/TextPrimary"
         android:layout_width="wrap_content"
@@ -65,7 +65,7 @@
 
     <!-- Which rail the thread rides. Shown only on Signal rows: unmarked means SMS,
          which keeps the marker off every row in an inbox that is mostly SMS. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/rail"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -86,7 +86,7 @@
         app:layout_constraintTop_toTopOf="@id/title"
         tools:visibility="visible" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/snippet"
         style="@style/TextSecondary"
         android:layout_width="0dp"
@@ -141,7 +141,7 @@
         tools:tint="@color/tools_theme"
         tools:visibility="visible" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/date"
         style="@style/TextTertiary"
         android:layout_width="wrap_content"

@@ -15,7 +15,7 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/toolbarTitle"
                 style="@style/ToolbarText"
                 android:layout_width="0dp"
@@ -24,7 +24,7 @@
 
             <!-- Crosses back to the SMS list. Present only while the two lists are being
                  kept apart; woven, this screen is not reached from a list at all. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/railBadge"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -52,7 +52,7 @@
 
     <!-- Says plainly when the bridge is unreachable. Receiving catches up on its own,
          but sending cannot happen, so this is not decoration. -->
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -72,7 +72,7 @@
         android:layout_height="0dp"
         android:layout_weight="1">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/empty"
             android:layout_width="match_parent"
             android:layout_height="match_parent"

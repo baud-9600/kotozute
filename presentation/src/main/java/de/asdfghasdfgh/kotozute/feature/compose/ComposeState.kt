@@ -1,0 +1,83 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.compose
+
+import de.asdfghasdfgh.kotozute.compat.SubscriptionInfoCompat
+import de.asdfghasdfgh.kotozute.model.Attachment
+import de.asdfghasdfgh.kotozute.model.Conversation
+import de.asdfghasdfgh.kotozute.model.Message
+import de.asdfghasdfgh.kotozute.model.Recipient
+import io.realm.RealmResults
+
+data class ComposeState(
+    val hasError: Boolean = false,
+    val editingMode: Boolean = false,
+    val threadId: Long = 0,
+    val selectedChips: List<Recipient> = ArrayList(),
+    val sendAsGroup: Boolean = true,
+    val conversationtitle: String = "",
+    val loading: Boolean = false,
+    val query: String = "",
+    val searchSelectionId: Long = -1,
+    val searchSelectionPosition: Int = 0,
+    val searchResults: Int = 0,
+    val messages: Pair<Conversation, RealmResults<Message>>? = null,
+    val selectedMessages: Int = 0,
+    val selectedMessagesHaveText: Boolean = false,
+    val scheduled: Long = 0,
+    val attachments: List<Attachment> = listOf(),
+    val attaching: Boolean = false,
+    val scheduling: Boolean = false,
+    val remaining: String = "",
+    /**
+     * Whether this draft has dropped the message to sixteen-bit characters.
+     *
+     * One character outside the plain SMS alphabet -- a curly apostrophe a keyboard put in
+     * by itself, an accent, a dash, an emoji -- re-encodes the whole message, and a part
+     * stops holding 160 characters and starts holding 70. Nothing on screen said so, and
+     * the length it was cut at was less than half what the sender expected.
+     */
+    val wideCharacters: Boolean = false,
+    val subscription: SubscriptionInfoCompat? = null,
+    val canSend: Boolean = false,
+    val muted: Boolean = false,
+    /** The conversation's own pin and shelf, for the menu's Pin and Archive. */
+    val pinned: Boolean = false,
+    val archived: Boolean = false,
+    /**
+     * Whether this conversation is with one person whom the address book does not know.
+     *
+     * Gates "Add to contacts" in the thread's overflow. The action already existed -- the
+     * inbox offers it on a long press, and the conversation-info screen does it when the
+     * recipient row is tapped -- but neither is where somebody looks while reading a text
+     * from a number they want to save, so in practice it could not be found.
+     */
+    val canAddContact: Boolean = false,
+    /** The same person has a Signal thread, so a way across can be offered. */
+    val signalThreadKey: String? = null,
+
+    /** The Signal thread of the single person chosen while composing a new conversation.
+     *  Separate from [signalThreadKey], which describes a conversation that already exists. */
+    val composeSignalThreadKey: String? = null,
+    val hasScheduledMessages: Boolean = false,
+    val validRecipientNumbers: Int = 1,
+    val recipientCount: Int = 1,
+    val audioMsgRecording: Boolean = false,
+    val saveDraft: Boolean = true,
+)

@@ -1,0 +1,156 @@
+package de.asdfghasdfgh.kotozute.model
+
+import io.realm.RealmObject
+import io.realm.annotations.Index
+import io.realm.annotations.PrimaryKey
+
+/**
+ * A Signal message, kept deliberately apart from [Message].
+ *
+ * [Message] is a mirror of the telephony content provider, and a full sync calls
+ * SyncRepositoryImpl.removeOldMessages(), which deletes every Message, Conversation,
+ * MmsPart and Recipient row before rebuilding them from the provider. Signal rows in
+ * those tables would be destroyed by an ordinary re-sync, so they live here instead.
+ *
+ * The primary key is "<authorUuid>:<timestamp>", which is how Signal itself identifies a
+ * message. Keying on it means a message can arrive twice
+ * (one logical message can produce several notifications, and an imported backup can
+ * re-deliver what we already hold) without ever duplicating.
+ */
+open class SignalMessage : RealmObject() {
+
+    @PrimaryKey var id: String = ""
+
+    /** "direct:<uuid>" or "group:<groupId>". */
+    @Index var threadKey: String = ""
+
+    /** Signal message timestamp, ms. Not necessarily in arrival order -- an import backfills. */
+    @Index var date: Long = 0
+
+    var senderUuid: String = ""
+    var senderNumber: String = ""
+
+    /** True for messages this account sent, from any device, including Note to Self. */
+    var outgoing: Boolean = false
+
+    var body: String = ""
+    var groupId: String = ""
+    var quoteTs: Long = 0
+    var read: Boolean = false
+
+    /** "live" from the connection's own stream, "import" from a restored Signal backup. */
+    var source: String = "live"
+
+    /**
+     * The attachment list, verbatim JSON. Realm cannot hold a list of plain
+     * objects without another RealmObject per row, and nothing queries inside this --
+     * it is read once when a row is drawn.
+     */
+    var attachments: String = ""
+
+    /**
+     * The body's styles: bold, italic, spoiler, strikethrough, monospace, as
+     * `[[start,length,"b"],...]` (see BodyStyles in the data module). Empty for plain text.
+     */
+    var styles: String = ""
+
+    /**
+     * When this copy must be gone, in ms; 0 means never. This is the only copy there is, so
+     * nothing else will ever remove it -- and unhonoured it keeps the message for ever, in
+     * the thread, in the inbox snippet, in search and in the browser. It was written when a
+     * bridge held a second copy and purged that one on time, which deleted the row nobody
+     * read and left this one standing.
+     */
+    @Index var expiresAt: Long = 0
+
+    /** The timer the sender set, in seconds; 0 for none. Kept so the UI can say so. */
+    var expiresInSeconds: Long = 0
+
+    /** Signal intends this to be opened once; its attachment is never stored. */
+    var viewOnce: Boolean = false
+
+    /**
+     * The group's master key, on a message that arrived in a group over this device's own
+     * connection.
+     *
+     * Kept because it is the only handle the server will answer questions about the group
+     * with -- its name, its members -- and a message is the only place it ever arrives.
+     * Without it a group can be read and not replied to.
+     */
+    var groupMasterKey: ByteArray? = null
+
+    /**
+     * When the far end acknowledged this message, and when it was read there. Zero for
+     * neither, and for every message that predates receipts being handled at all.
+     *
+     * Only meaningful on an outgoing message: a receipt is something other people send about
+     * ours.
+     */
+    var deliveredAt: Long = 0
+    var readAt: Long = 0
+
+    /**
+     * When a view-once picture of ours was opened, or a voice message of ours played: Signal's
+     * "viewed" receipt, which is a claim of its own -- read is not viewed. Outgoing only.
+     */
+    var viewedAt: Long = 0
+
+    /**
+     * Reactions on this message, as JSON: [{"emoji":"...","who":"<uuid>"}].
+     *
+     * Held on the message rather than in a table of their own. A reaction is never read
+     * except while drawing the message it belongs to, and a handful of them per message is
+     * not a thing worth a join.
+     */
+    var reactions: String = ""
+
+    /**
+     * Where one of our own messages is on its way out: [SEND_SENT], [SEND_SENDING] or
+     * [SEND_FAILED].
+     *
+     * Signal writes an outgoing message before it sends it and resends whatever is still
+     * sending when the app next starts (`RetryPendingSendsJob`), so a send cut off by the
+     * process being killed is not lost. The row used to be written only after the server had
+     * the message, and a send cut off halfway simply vanished.
+     */
+    var sendState: Int = SEND_SENT
+
+    /**
+     * The sent timestamp of this message's latest edit, or 0 if it was never edited.
+     *
+     * An edit names the revision it replaces, and Signal's clients name the **latest** one
+     * (`IndividualSendJobV2` targets `originalEditedMessage.dateSent`, the revision on screen).
+     * The row here keeps the original's identity, so without this a second edit named a
+     * timestamp no row had and arrived as a new message.
+     */
+    var revisionTs: Long = 0
+
+    /**
+     * What an edited message said before, oldest first, as `[{"at":ts,"body":"..."},...]`:
+     * upstream's edit history. Empty for a message never edited here.
+     */
+    var revisions: String = ""
+
+    /** The poll this message asks, with its votes, as `Polls.encode` writes it; empty for none. */
+    var poll: String = ""
+
+    /** When this message was pinned in its conversation; 0 when it is not. */
+    var pinnedAt: Long = 0
+
+    /** When the pin lapses, [Long.MAX_VALUE] for one kept until unpinned; 0 when not pinned. */
+    var pinnedUntil: Long = 0
+
+    /**
+     * A line saying what changed in the conversation -- a timer set, a group renamed -- rather
+     * than something anybody wrote. Upstream keeps these as their own kind of row and draws
+     * them centred with no bubble (`ConversationUpdateItem`, `conversation_item_update.xml`);
+     * drawn as a bubble on its author's side, "You set the timer" read as a message.
+     */
+    var update: Boolean = false
+
+    companion object {
+        const val SEND_SENT = 0
+        const val SEND_SENDING = 1
+        const val SEND_FAILED = 2
+    }
+}

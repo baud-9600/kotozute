@@ -22,7 +22,7 @@
         android:layout_height="wrap_content"
         android:visibility="gone">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/toolbarTitle"
             style="@style/ToolbarText"
             android:layout_width="match_parent"
@@ -30,7 +30,7 @@
 
     </androidx.appcompat.widget.Toolbar>
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/name"
         style="@style/TextPrimary"
         android:layout_width="match_parent"
@@ -41,7 +41,7 @@
         android:textSize="32sp"
         tools:text="Sam" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/status"
         style="@style/TextSecondary"
         android:layout_width="match_parent"

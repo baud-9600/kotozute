@@ -24,7 +24,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    tools:context="com.wanderwildwood.kotozute.feature.compose.ComposeActivity">
+    tools:context="de.asdfghasdfgh.kotozute.feature.compose.ComposeActivity">
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/contacts"
@@ -62,7 +62,7 @@
             <!-- Crosses to the other address book: the phone's contacts, or the people on
                  Signal. Gone when there is no second book to cross to. The same badge the
                  two conversation lists use. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/railBadge"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -87,7 +87,7 @@
                 android:layout_height="match_parent"
                 android:layout_weight="1">
 
-                <com.wanderwildwood.kotozute.common.widget.QkEditText
+                <de.asdfghasdfgh.kotozute.common.widget.QkEditText
                     android:id="@+id/search"
                     style="@style/ToolbarText"
                     android:layout_marginTop="8dp"
@@ -106,7 +106,7 @@
                     app:textSize="primary"
                     tools:textSize="16sp" />
 
-    <!--            <com.wanderwildwood.kotozute.common.widget.QkEditText-->
+    <!--            <de.asdfghasdfgh.kotozute.common.widget.QkEditText-->
     <!--                android:id="@+id/search"-->
     <!--                android:layout_width="match_parent"-->
     <!--                android:layout_height="match_parent"-->

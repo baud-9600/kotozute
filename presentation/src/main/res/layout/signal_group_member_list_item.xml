@@ -14,7 +14,7 @@
     android:paddingEnd="12dp"
     android:paddingBottom="10dp">
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/title"
         style="@style/TextPrimary"
         android:layout_width="match_parent"
@@ -24,7 +24,7 @@
         android:textStyle="bold"
         tools:text="Ada" />
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/subtitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

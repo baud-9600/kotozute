@@ -16,7 +16,7 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/title"
             style="@style/TextPrimary"
             android:layout_width="0dp"
@@ -28,7 +28,7 @@
 
         <!-- Was the word "Signal" on every row. This list is nothing but Signal, so it
              said the same thing 55 times; the time is what a row here was missing. -->
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/timestamp"
             style="@style/TextTertiary"
             android:layout_width="wrap_content"
@@ -45,7 +45,7 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/subtitle"
             style="@style/TextSecondary"
             android:layout_width="0dp"

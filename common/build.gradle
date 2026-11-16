@@ -28,7 +28,7 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
     }
-    namespace 'com.wanderwildwood.kotozute.common'
+    namespace 'de.asdfghasdfgh.kotozute.common'
 }
 
 dependencies {

@@ -17,7 +17,7 @@
         android:id="@+id/toolbar"
         style="@style/Toolbar">
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/toolbarTitle"
             style="@style/ToolbarText"
             android:layout_width="match_parent"
@@ -28,7 +28,7 @@
 
     <include layout="@layout/top_bar_rule" />
 
-    <com.wanderwildwood.kotozute.common.widget.PagingScrollView
+    <de.asdfghasdfgh.kotozute.common.widget.PagingScrollView
         android:id="@+id/scroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -43,7 +43,7 @@
 
         <!-- Said before anything is typed, not after. Registering deregisters Signal wherever
              else this number is, and that is not recoverable by tapping back. -->
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/warning"
             style="@style/TextPrimary"
             android:layout_width="match_parent"
@@ -71,14 +71,14 @@
             android:layout_height="wrap_content"
             android:orientation="vertical">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:paddingBottom="4dp"
                 android:text="@string/signal_register_number_hint" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkEditText
+            <de.asdfghasdfgh.kotozute.common.widget.QkEditText
                 android:id="@+id/number"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -104,14 +104,14 @@
             android:visibility="gone"
             tools:visibility="visible">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:paddingBottom="4dp"
                 android:text="@string/signal_register_code_hint" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkEditText
+            <de.asdfghasdfgh.kotozute.common.widget.QkEditText
                 android:id="@+id/code"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -130,7 +130,7 @@
             <!-- Said here rather than in a help page, because this is where someone is sitting
                  waiting for a code that is never going to arrive. Found the hard way: a Google
                  Voice number received neither the text nor the call. -->
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 android:id="@+id/noCode"
                 style="@style/TextTertiary"
                 android:layout_width="match_parent"
@@ -165,14 +165,14 @@
             android:visibility="gone"
             tools:visibility="gone">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:paddingBottom="4dp"
                 android:text="@string/signal_register_pin_hint" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkEditText
+            <de.asdfghasdfgh.kotozute.common.widget.QkEditText
                 android:id="@+id/pin"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -197,14 +197,14 @@
             android:visibility="gone"
             tools:visibility="gone">
 
-            <com.wanderwildwood.kotozute.common.widget.QkTextView
+            <de.asdfghasdfgh.kotozute.common.widget.QkTextView
                 style="@style/TextSecondary"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:paddingBottom="4dp"
                 android:text="@string/signal_register_name_hint" />
 
-            <com.wanderwildwood.kotozute.common.widget.QkEditText
+            <de.asdfghasdfgh.kotozute.common.widget.QkEditText
                 android:id="@+id/givenName"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -214,7 +214,7 @@
                 tools:text="Wander" />
 
             <!-- Optional, and Signal treats it that way too: a given name alone is a name. -->
-            <com.wanderwildwood.kotozute.common.widget.QkEditText
+            <de.asdfghasdfgh.kotozute.common.widget.QkEditText
                 android:id="@+id/familyName"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -247,7 +247,7 @@
             tools:visibility="gone"
             android:scrollbars="none" />
 
-        <com.wanderwildwood.kotozute.common.widget.QkTextView
+        <de.asdfghasdfgh.kotozute.common.widget.QkTextView
             android:id="@+id/status"
             style="@style/TextSecondary"
             android:layout_width="match_parent"
@@ -257,6 +257,6 @@
 
     </LinearLayout>
 
-    </com.wanderwildwood.kotozute.common.widget.PagingScrollView>
+    </de.asdfghasdfgh.kotozute.common.widget.PagingScrollView>
 
 </LinearLayout>

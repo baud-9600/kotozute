@@ -23,7 +23,7 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content">
 
-    <com.wanderwildwood.kotozute.common.widget.RadioPreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.RadioPreferenceView
         android:id="@+id/number"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

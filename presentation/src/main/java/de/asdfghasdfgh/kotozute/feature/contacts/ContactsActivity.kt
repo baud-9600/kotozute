@@ -1,0 +1,248 @@
+/*
+ * Copyright (C) 2019 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.contacts
+
+import android.app.Activity
+import android.content.Intent
+import android.os.Bundle
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.view.isVisible
+import androidx.lifecycle.ViewModelProviders
+import com.jakewharton.rxbinding2.view.clicks
+import com.jakewharton.rxbinding2.widget.editorActions
+import com.jakewharton.rxbinding2.widget.textChanges
+import dagger.android.AndroidInjection
+import de.asdfghasdfgh.kotozute.R
+import de.asdfghasdfgh.kotozute.common.Navigator
+import de.asdfghasdfgh.kotozute.common.ViewModelFactory
+import de.asdfghasdfgh.kotozute.common.base.QkThemedActivity
+import de.asdfghasdfgh.kotozute.common.util.extensions.hideKeyboard
+import de.asdfghasdfgh.kotozute.common.util.extensions.showKeyboard
+import de.asdfghasdfgh.kotozute.common.widget.QkDialog
+import de.asdfghasdfgh.kotozute.extensions.Optional
+import de.asdfghasdfgh.kotozute.feature.compose.editing.ComposeItem
+import de.asdfghasdfgh.kotozute.feature.compose.editing.ComposeItemAdapter
+import de.asdfghasdfgh.kotozute.feature.compose.editing.PhoneNumberAction
+import de.asdfghasdfgh.kotozute.feature.compose.editing.PhoneNumberPickerAdapter
+import de.asdfghasdfgh.kotozute.feature.signal.SignalNewGroupActivity
+import io.reactivex.Observable
+import io.reactivex.subjects.BehaviorSubject
+import io.reactivex.subjects.PublishSubject
+import io.reactivex.subjects.Subject
+import javax.inject.Inject
+import de.asdfghasdfgh.kotozute.databinding.ContactsActivityBinding
+import de.asdfghasdfgh.kotozute.common.util.extensions.turnsAPageOnSwipe
+
+class ContactsActivity : QkThemedActivity(), ContactsContract {
+
+    private val binding by lazy { ContactsActivityBinding.inflate(layoutInflater) }
+
+    companion object {
+        const val SHARING_KEY = "sharing"
+        /** Open showing the Signal address book. Set when the Signal rail opens this. */
+        const val SIGNAL_KEY = "signal"
+        const val CHIPS_KEY = "chips"
+        const val SIGNAL_THREAD_KEY = "signalThreadKey"
+        const val SIGNAL_THREAD_TITLE = "signalThreadTitle"
+    }
+
+    @Inject lateinit var contactsAdapter: ComposeItemAdapter
+    @Inject lateinit var phoneNumberAdapter: PhoneNumberPickerAdapter
+    @Inject lateinit var viewModelFactory: ViewModelFactory
+    @Inject lateinit var navigator: Navigator
+    @Inject lateinit var signalRepo: de.asdfghasdfgh.kotozute.repository.SignalRepository
+
+    override val queryChangedIntent: Observable<CharSequence> by lazy { binding.search.textChanges() }
+    override val queryClearedIntent: Observable<*> by lazy { binding.cancel.clicks() }
+    override val queryEditorActionIntent: Observable<Int> by lazy { binding.search.editorActions() }
+    override val screenShownIntent: Subject<Unit> = BehaviorSubject.createDefault(Unit)
+    override val composeItemPressedIntent: Subject<ComposeItem> by lazy { contactsAdapter.clicks }
+    override val composeItemLongPressedIntent: Subject<ComposeItem> by lazy { contactsAdapter.longClicks }
+    override val phoneNumberSelectedIntent: Subject<Optional<Long>> by lazy { phoneNumberAdapter.selectedItemChanges }
+    override val phoneNumberActionIntent: Subject<PhoneNumberAction> = PublishSubject.create()
+
+    override val railSwitchIntent: Subject<Unit> = PublishSubject.create()
+
+    private val viewModel by lazy { ViewModelProviders.of(this, viewModelFactory)[ContactsViewModel::class.java] }
+
+    private val phoneNumberDialog by lazy {
+        QkDialog(this).apply {
+            titleRes = R.string.compose_number_picker_title
+            adapter = phoneNumberAdapter
+            positiveButton = R.string.compose_number_picker_always
+            positiveButtonListener = { phoneNumberActionIntent.onNext(PhoneNumberAction.ALWAYS) }
+            negativeButton = R.string.compose_number_picker_once
+            negativeButtonListener = { phoneNumberActionIntent.onNext(PhoneNumberAction.JUST_ONCE) }
+            cancelListener = { phoneNumberActionIntent.onNext(PhoneNumberAction.CANCEL) }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        AndroidInjection.inject(this)
+        super.onCreate(savedInstanceState)
+        setContentView(binding.root)
+        showBackButton(true)
+        viewModel.bindView(this)
+
+        binding.contacts.adapter = contactsAdapter
+        // Asked for on the forum alongside the conversation list, and the same reasoning
+        // applies: this is a long list on a panel that redraws in full.
+        binding.contacts.turnsAPageOnSwipe()
+
+        binding.railBadge.setOnClickListener { railSwitchIntent.onNext(Unit) }
+
+        // Back goes to the SMS inbox, because this screen is otherwise reached from the
+        // composer and returning there would show an empty message nobody asked to keep.
+        // Opened from the Signal rail there is no such composer behind it, and the list it
+        // came from is the right place to land.
+        if (!intent.getBooleanExtra(SIGNAL_KEY, false)) {
+            val callback = object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    navigator.showMainActivity()
+                }
+            }
+            onBackPressedDispatcher.addCallback(this, callback)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        screenShownIntent.onNext(Unit)
+    }
+
+    override fun render(state: ContactsState) {
+        binding.cancel.isVisible = state.query.length > 1
+
+        // Names where you are, and the arrow says you can cross -- the same badge, and the
+        // same reading of it, as the two conversation lists.
+        binding.railBadge.isVisible = state.canCrossRails
+        binding.railBadge.setText(
+            if (state.showingSignal) R.string.signal_rail_label_switch
+            else R.string.sms_rail_label_switch
+        )
+        binding.search.setHint(
+            if (state.showingSignal) R.string.contacts_signal_hint else R.string.title_compose
+        )
+        // The badge has its own place in the row, in front of the field. The clear button
+        // sits over the field's end, so while it shows the text stops short of it, and a
+        // long query scrolls inside what is left rather than running underneath.
+        val end = if (binding.cancel.isVisible) cancelInset else searchEndPadding
+        if (binding.search.paddingEnd != end) {
+            binding.search.setPaddingRelative(
+                binding.search.paddingStart, binding.search.paddingTop,
+                end, binding.search.paddingBottom
+            )
+        }
+
+        contactsAdapter.data = state.composeItems
+
+        if (state.selectedContact != null && !phoneNumberDialog.isShowing) {
+            phoneNumberAdapter.data = state.selectedContact.numbers
+            phoneNumberDialog.subtitle = state.selectedContact.name
+            phoneNumberDialog.show()
+        } else if (state.selectedContact == null && phoneNumberDialog.isShowing) {
+            phoneNumberDialog.dismiss()
+        }
+    }
+
+    /** The field's own end padding, as in the layout. */
+    private val searchEndPadding by lazy {
+        (12 * resources.displayMetrics.density).toInt()
+    }
+
+    /** Room for the clear button (48dp, 8dp from the end) over the field's end. */
+    private val cancelInset by lazy {
+        (48 * resources.displayMetrics.density).toInt()
+    }
+
+    override fun clearQuery() {
+        binding.search.text = null
+    }
+
+    override fun openKeyboard() {
+        binding.search.postDelayed({
+            binding.search.showKeyboard()
+        }, 200)
+    }
+
+    override fun finish(result: HashMap<String, String?>) {
+        binding.search.hideKeyboard()
+        val intent = Intent().putExtra(CHIPS_KEY, result)
+        setResult(Activity.RESULT_OK, intent)
+        finish()
+    }
+
+    /**
+     * Handed back to the composer rather than opened here, so that the composer can stand
+     * aside as it does for the rail badge: a Signal conversation reached this way has the
+     * conversation list behind it, not an empty new message nobody asked to keep.
+     */
+    override fun finishWithSignalThread(threadKey: String, title: String) {
+        binding.search.hideKeyboard()
+        val intent = Intent()
+                .putExtra(SIGNAL_THREAD_KEY, threadKey)
+                .putExtra(SIGNAL_THREAD_TITLE, title)
+        setResult(Activity.RESULT_OK, intent)
+        finish()
+    }
+
+    /**
+     * The group is made on its own screen and handed back the same way a person is, so the
+     * composer behind this one still gets to stand aside.
+     */
+    /** Signal's find-by-username, handed back like any other Signal person picked here. */
+    override fun showFindUsername() {
+        de.asdfghasdfgh.kotozute.common.widget.TextInputDialog(this, getString(R.string.signal_find_username_hint)) { text ->
+            if (text.isBlank()) return@TextInputDialog
+            Thread {
+                val found = signalRepo.findByUsername(text)
+                runOnUiThread {
+                    if (isFinishing) return@runOnUiThread
+                    val message = when (found) {
+                        is de.asdfghasdfgh.kotozute.repository.SignalRepository.FindOutcome.Found -> {
+                            finishWithSignalThread(found.threadKey, found.title)
+                            return@runOnUiThread
+                        }
+                        de.asdfghasdfgh.kotozute.repository.SignalRepository.FindOutcome.NotFound -> getString(R.string.signal_find_username_none)
+                        de.asdfghasdfgh.kotozute.repository.SignalRepository.FindOutcome.Invalid -> getString(R.string.signal_find_username_invalid)
+                        is de.asdfghasdfgh.kotozute.repository.SignalRepository.FindOutcome.Failed -> getString(R.string.signal_find_username_failed, found.why)
+                    }
+                    android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
+                }
+            }.also { it.isDaemon = true }.start()
+        }.apply { setTitle(R.string.signal_find_username) }.show()
+    }
+
+    override fun showNewGroup() {
+        binding.search.hideKeyboard()
+        newGroup.launch(SignalNewGroupActivity.intentFor(this))
+    }
+
+    private val newGroup = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
+        val data = result.data ?: return@registerForActivityResult
+        val threadKey = data.getStringExtra(SIGNAL_THREAD_KEY).orEmpty()
+        if (threadKey.isBlank()) return@registerForActivityResult
+        finishWithSignalThread(threadKey, data.getStringExtra(SIGNAL_THREAD_TITLE).orEmpty())
+    }
+
+}

@@ -71,7 +71,7 @@
 
         <!-- Starts dark mode before the first screen is drawn. Holds no data. -->
         <provider
-            android:name="com.wanderwildwood.kotozute.common.DarkModeInit"
+            android:name="de.asdfghasdfgh.kotozute.common.DarkModeInit"
             android:authorities="${applicationId}.darkmodeinit"
             android:exported="false" />
 
@@ -138,7 +138,7 @@
             android:exported="true"
             android:targetActivity=".feature.settings.SettingsActivity">
             <intent-filter>
-                <action android:name="com.wanderwildwood.kotozute.action.LOCK_SCREEN_SETTING" />
+                <action android:name="de.asdfghasdfgh.kotozute.action.LOCK_SCREEN_SETTING" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity-alias>

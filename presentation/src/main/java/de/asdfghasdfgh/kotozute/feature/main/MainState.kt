@@ -1,0 +1,71 @@
+/*
+ * Copyright (C) 2017 Moez Bhatti <moez.bhatti@gmail.com>
+ *
+ * This file is part of QKSMS.
+ *
+ * QKSMS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QKSMS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QKSMS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package de.asdfghasdfgh.kotozute.feature.main
+
+import de.asdfghasdfgh.kotozute.feature.conversations.InboxItem
+import de.asdfghasdfgh.kotozute.model.SearchResult
+import de.asdfghasdfgh.kotozute.repository.SyncRepository
+import io.realm.RealmResults
+
+data class MainState(
+    val hasError: Boolean = false,
+    val page: MainPage = Inbox(),
+    val syncing: SyncRepository.SyncProgress = SyncRepository.SyncProgress.Idle,
+    /** True when Signal is on and the two lists are being kept apart, so a crossing is
+     *  worth offering. Woven, there is nowhere to cross to. */
+    val separateSignalList: Boolean = false,
+    /** Anything unread on either rail. Decides whether Mark all read is offered at all. */
+    val hasUnread: Boolean = false,
+    val defaultSms: Boolean = true,
+    /** Off once somebody has said texts belong to another app. See `Preferences.askDefaultSms`. */
+    val askDefaultSms: Boolean = true,
+    val smsPermission: Boolean = true,
+    val contactPermission: Boolean = true,
+    val notificationPermission: Boolean = true,
+)
+
+sealed class MainPage
+
+data class Inbox(
+    val addContact: Boolean = false,
+    val markPinned: Boolean = true,
+    val markMuted: Boolean = true,
+    val markRead: Boolean = false,
+    /** One text conversation selected; a Signal thread has no local name to set. */
+    val rename: Boolean = false,
+    val data: List<InboxItem>? = null,
+    val selected: Int = 0,
+    val filter: Int = 0 // 0=All, 1=Groups, 2=Unknown
+) : MainPage()
+
+data class Searching(
+    val loading: Boolean = false,
+    val data: List<InboxSearchResult>? = null
+) : MainPage()
+
+data class Archived(
+    val addContact: Boolean = false,
+    val markPinned: Boolean = true,
+    val markMuted: Boolean = true,
+    val markRead: Boolean = false,
+    /** One text conversation selected; a Signal thread has no local name to set. */
+    val rename: Boolean = false,
+    val data: List<InboxItem>? = null,
+    val selected: Int = 0
+) : MainPage()

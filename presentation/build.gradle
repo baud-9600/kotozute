@@ -174,7 +174,7 @@ android {
         abortOnError false
         checkReleaseBuilds false
     }
-    namespace 'com.wanderwildwood.kotozute'
+    namespace 'de.asdfghasdfgh.kotozute'
     // Named so AGP can find the strip tool. Without an NDK it skips stripping silently, and
     // libsignal's engine ships unstripped: 113 MB of native library, 100 MB of which is debug
     // information that cannot be used on a phone and that no user should be downloading.

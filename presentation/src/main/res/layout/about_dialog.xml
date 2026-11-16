@@ -10,7 +10,7 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
-    <com.wanderwildwood.kotozute.common.widget.QkTextView
+    <de.asdfghasdfgh.kotozute.common.widget.QkTextView
         android:id="@+id/name"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -22,7 +22,7 @@
         app:textSize="primary"
         tools:text="Messaging 1.5.3" />
 
-    <com.wanderwildwood.kotozute.common.widget.PagingScrollView
+    <de.asdfghasdfgh.kotozute.common.widget.PagingScrollView
         android:id="@+id/scroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -38,6 +38,6 @@
             android:paddingEnd="24dp"
             android:paddingBottom="8dp" />
 
-    </com.wanderwildwood.kotozute.common.widget.PagingScrollView>
+    </de.asdfghasdfgh.kotozute.common.widget.PagingScrollView>
 
 </LinearLayout>

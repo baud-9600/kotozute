@@ -24,37 +24,37 @@
     android:orientation="vertical">
 
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/groupName"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/info_name" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/notifications"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/info_notifications" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/markUnread"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/main_menu_unread" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/archive"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/info_archive" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/block"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         app:title="@string/info_block" />
 
-    <com.wanderwildwood.kotozute.common.widget.PreferenceView
+    <de.asdfghasdfgh.kotozute.common.widget.PreferenceView
         android:id="@+id/delete"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
